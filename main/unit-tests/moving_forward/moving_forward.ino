@@ -59,15 +59,15 @@ static_assert(
 constexpr int FORWARD_TARGET_MM =
     CELL_LENGTH_MM * FORWARD_CELLS;
 
-constexpr int FORWARD_SPEED = 70;
+constexpr int FORWARD_SPEED = 160;         //////////// speeeed
 
 constexpr unsigned long MOVE_TIMEOUT_MS =
     105000UL; // Whole seven-cell run; stall timeout remains 1500 ms.
     
 constexpr unsigned long STALL_TIMEOUT_MS = 1500;
 
-constexpr float LEFT_FACTOR = 0.88f;
-constexpr float RIGHT_FACTOR = 0.9f;
+constexpr float RIGHT_FACTOR = 0.99f;
+constexpr float LEFT_FACTOR = 1.0f;
 
 // Working main.ino behavior: asymmetric thresholds and slow the same named motor.
 constexpr int WALL_SLOW_SPEED = 30;
@@ -78,9 +78,17 @@ constexpr int RIGHT_WALL_THRESHOLD_MM = 40; // Chassis clearance: formerly 50 mm
 // its useful range. Keep that distinct from an I2C/timeout fault and classify it
 // as open space, safely above the 140 mm wall-retention threshold.
 constexpr int SIDE_NO_TARGET_MM = 200;
-constexpr ForwardWallSettings WALL_SETTINGS = {
-    FORWARD_SPEED, WALL_SLOW_SPEED, LEFT_WALL_THRESHOLD_MM, RIGHT_WALL_THRESHOLD_MM
+// Case 1: center between two side walls using right-clearance minus left-clearance.
+constexpr float TWO_WALL_KP = 7.3f;
+constexpr float TWO_WALL_KI = 0.0f;
+constexpr float TWO_WALL_KD = 4.4f;
+constexpr float TWO_WALL_MAX_PWM = 40.0f;
+constexpr float TWO_WALL_TOLERANCE_MM = 3.6f;
+constexpr TwoWallPidSettings TWO_WALL_PID_SETTINGS = {
+    TWO_WALL_TOLERANCE_MM, WALL_SLOW_SPEED,
+    TWO_WALL_KP, TWO_WALL_KI, TWO_WALL_KD, TWO_WALL_MAX_PWM
 };
+TwoWallPidController twoWallPid;
 // Distance PID changes forward speed only; preserve the working steering direction.
 constexpr float APPROACH_SLOWDOWN_TICKS = 300.0f;
 constexpr int MIN_APPROACH_PWM = 35;
@@ -585,6 +593,7 @@ bool runForwardDistance() {
     bool distanceCompleted = false;
     unsigned long previousControlMs = started;
     approachPid.reset();
+    twoWallPid.reset();
     singleWallPid.reset();
     noWallPid.reset();
 
@@ -662,9 +671,6 @@ bool runForwardDistance() {
         float dt = (controlMs - previousControlMs) / 1000.0f;
         previousControlMs = controlMs;
         int approachSpeed = approachPid.update((float)remaining, dt);
-        ForwardWallSettings steering = WALL_SETTINGS;
-        steering.baseSpeed = approachSpeed;
-        if (steering.slowSpeed > approachSpeed) steering.slowSpeed = approachSpeed;
         ForwardMotorCommands commands;
         float wallError=0, wallPwm=0, mpuPwm=0;
         float encoderError=0, encoderPwm=0;
@@ -673,12 +679,15 @@ bool runForwardDistance() {
         if (mode==WallMode::Two) {
             singleWallPid.reset();
             noWallPid.reset();
-            commands=forwardWallCommands(sideLeft,sideRight,steering);
+            commands=twoWallPid.update(sideLeft,sideRight,approachSpeed,
+                TWO_WALL_PID_SETTINGS,dt,wallError,wallPwm);
         } else if (mode==WallMode::LeftOnly || mode==WallMode::RightOnly) {
+            twoWallPid.reset();
             noWallPid.reset();
             commands=singleWallPid.update(mode,sideLeft,sideRight,yawRight,rateRight,
                 approachSpeed,SINGLE_WALL_SETTINGS,dt,wallError,wallPwm,mpuPwm);
         } else {
+            twoWallPid.reset();
             singleWallPid.reset();
             commands=noWallPid.update(left,right,approachSpeed,
                 NO_WALL_SETTINGS,dt,encoderError,encoderPwm);
@@ -703,6 +712,7 @@ bool runForwardDistance() {
     unsigned long brakeLeft, brakeRight;
     readTicks(brakeLeft, brakeRight);
     approachPid.reset();
+    twoWallPid.reset();
     singleWallPid.reset();
     noWallPid.reset();
     waitWithMotionService(100); // Sample yaw and residual movement after braking.

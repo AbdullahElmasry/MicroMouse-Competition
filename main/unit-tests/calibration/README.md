@@ -1,5 +1,7 @@
 # Manual calibration
 
+For a raw full-power direction and motor-strength check, use [`motor_full_power/motor_full_power.ino`](motor_full_power/motor_full_power.ino).
+
 Open and upload one sketch at a time from its own folder. Separate sketch folders prevent Arduino from combining two setup()/loop() definitions. Serial Monitor: 115200 baud. Both sketches hold motor-enable pin 23 LOW and the motor inputs LOW. Confirm the actual driver lets the wheels roll freely; do not force a braked drivetrain.
 
 ## Encoder ticks over eight cells
