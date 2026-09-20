@@ -46,6 +46,11 @@ void drive(int left, int right) {
   motor(RIGHT_IN1, RIGHT_IN2, right, RIGHT_FACTOR, true);
 }
 
+bool sensorResponds(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
 bool initSensors() {
   Wire.begin(); // Uses the board's default SDA/SCL, as in main.ino.
   pinMode(LEFT_XSHUT, OUTPUT);
@@ -58,15 +63,23 @@ bool initSensors() {
   digitalWrite(LEFT_XSHUT, HIGH);
   delay(50);
   leftTof.setTimeout(200);
-  if (!leftTof.init()) return false;
+  if (!sensorResponds(0x29)) return false;
+  leftTof.init(); // VL6180X::init() returns void.
+  if (leftTof.last_status != 0) return false;
   leftTof.configureDefault();
+  if (leftTof.last_status != 0) return false;
   leftTof.setAddress(0x30);
+  if (leftTof.last_status != 0 || !sensorResponds(0x30)) return false;
   digitalWrite(RIGHT_XSHUT, HIGH);
   delay(50);
   rightTof.setTimeout(200);
-  if (!rightTof.init()) return false;
+  if (!sensorResponds(0x29)) return false;
+  rightTof.init(); // VL6180X::init() returns void.
+  if (rightTof.last_status != 0) return false;
   rightTof.configureDefault();
+  if (rightTof.last_status != 0) return false;
   rightTof.setAddress(0x31);
+  if (rightTof.last_status != 0 || !sensorResponds(0x31)) return false;
   digitalWrite(FRONT_XSHUT, HIGH);
   delay(50);
   frontTof.setTimeout(200);
