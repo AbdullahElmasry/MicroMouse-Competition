@@ -4,6 +4,9 @@
 #include <VL53L1X.h>
 #include "ForwardWallControl.h"
 #include "CellApproachControl.h"
+#include "SingleWallControl.h"
+#include "NoWallControl.h"
+#include "MpuYaw.h"
 #include "MovementCommands.h"
 
 // ============================================================
@@ -39,18 +42,18 @@ constexpr float RIGHT_TICKS_PER_CELL =
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 7;
-constexpr unsigned long CELL_PAUSE_MS = 500;
+constexpr int FRONT_EMERGENCY_STOP_MM = 40;
 
 constexpr unsigned long LEFT_TARGET_TICKS =
-    (unsigned long)(LEFT_TICKS_PER_CELL + 0.5f);
+    (unsigned long)(LEFT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 constexpr unsigned long RIGHT_TARGET_TICKS =
-    (unsigned long)(RIGHT_TICKS_PER_CELL + 0.5f);
+    (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 623 &&
-    RIGHT_TARGET_TICKS == 619,
-    "Check one-cell targets from seven-cell calibration"
+    LEFT_TARGET_TICKS == 4359 &&
+    RIGHT_TARGET_TICKS == 4335,
+    "Check continuous seven-cell targets from calibration"
 );
 
 constexpr int FORWARD_TARGET_MM =
@@ -59,17 +62,22 @@ constexpr int FORWARD_TARGET_MM =
 constexpr int FORWARD_SPEED = 70;
 
 constexpr unsigned long MOVE_TIMEOUT_MS =
-    15000UL; // Per-cell movement timeout; pauses are separate.
-
+    105000UL; // Whole seven-cell run; stall timeout remains 1500 ms.
+    
 constexpr unsigned long STALL_TIMEOUT_MS = 1500;
 
-constexpr float LEFT_FACTOR = 1.0f;
-constexpr float RIGHT_FACTOR = 0.78f;
+constexpr float LEFT_FACTOR = 0.88f;
+constexpr float RIGHT_FACTOR = 0.9f;
 
 // Working main.ino behavior: asymmetric thresholds and slow the same named motor.
 constexpr int WALL_SLOW_SPEED = 30;
 constexpr int LEFT_WALL_THRESHOLD_MM = 40;
-constexpr int RIGHT_WALL_THRESHOLD_MM = 50;
+constexpr int RIGHT_TOF_INSET_MM = 10;
+constexpr int RIGHT_WALL_THRESHOLD_MM = 40; // Chassis clearance: formerly 50 mm raw.
+// A healthy VL6180X can report no valid target when the nearest wall is outside
+// its useful range. Keep that distinct from an I2C/timeout fault and classify it
+// as open space, safely above the 140 mm wall-retention threshold.
+constexpr int SIDE_NO_TARGET_MM = 200;
 constexpr ForwardWallSettings WALL_SETTINGS = {
     FORWARD_SPEED, WALL_SLOW_SPEED, LEFT_WALL_THRESHOLD_MM, RIGHT_WALL_THRESHOLD_MM
 };
@@ -81,10 +89,41 @@ constexpr CellApproachSettings APPROACH_SETTINGS = {
     APPROACH_SLOWDOWN_TICKS, // Begin approach about 87 mm before braking.
     FORWARD_SPEED, MIN_APPROACH_PWM
 };
-constexpr unsigned long BRAKE_LEAD_TICKS = 10; // Brake about 2.9 mm earlier per cell.
+constexpr unsigned long BRAKE_LEAD_TICKS = 10; // Brake about 2.9 mm before the full-run endpoint.
 static_assert(BRAKE_LEAD_TICKS < LEFT_TARGET_TICKS && BRAKE_LEAD_TICKS < RIGHT_TARGET_TICKS,
-              "Brake lead must be smaller than a cell");
+              "Brake lead must be smaller than the run target");
 CellApproachController approachPid(APPROACH_SETTINGS);
+// +1 if MPU yaw increases on a physical right turn; -1 if it decreases.
+// 0 leaves one-wall motion disabled until mounting direction is confirmed.
+constexpr float MPU_YAW_SIGN = -1.0f;
+constexpr float SINGLE_WALL_KP = 1.4f;
+constexpr float SINGLE_WALL_KI = 0.0f;
+constexpr float SINGLE_WALL_KD = 5.5f;
+constexpr float SINGLE_WALL_MAX_PWM = 40.0f;
+constexpr SingleWallSettings SINGLE_WALL_SETTINGS = {
+    (float)LEFT_WALL_THRESHOLD_MM, (float)RIGHT_WALL_THRESHOLD_MM, 3.6f,
+    WALL_SLOW_SPEED, // Minimum commanded PWM during correction.
+    1.0f, 0.10f, 5.0f, // MPU trim only inside the distance band; max 5 PWM.
+    SINGLE_WALL_KP, SINGLE_WALL_KI, SINGLE_WALL_KD, SINGLE_WALL_MAX_PWM
+};
+SingleWallController singleWallPid;
+// Case 3 uses the manual 7-cell calibration to compare travelled distance.
+constexpr float NO_WALL_ENCODER_KP = 1.0f;
+constexpr float NO_WALL_ENCODER_KI = 0.10f;
+constexpr float NO_WALL_ENCODER_KD = 0.0f;
+constexpr float NO_WALL_ENCODER_MAX_PWM = 40.0f;
+constexpr NoWallSettings NO_WALL_SETTINGS = {
+    LEFT_TICKS_PER_CELL, RIGHT_TICKS_PER_CELL,
+    WALL_SLOW_SPEED,
+    {NO_WALL_ENCODER_KP, NO_WALL_ENCODER_KI,
+     NO_WALL_ENCODER_KD, NO_WALL_ENCODER_MAX_PWM}
+};
+NoWallController noWallPid;
+MpuYaw mpuYaw;
+WallModeDetector wallDetector;
+bool motionActive=false;
+bool motionStopRequested=false;
+bool sideCommunicationFault=false;
 
 // ============================================================
 // Sensors / encoders
@@ -201,7 +240,7 @@ void handleWiFiClient() {
         );
 
         wifiSerialClient.println(
-            "Send start for 7 cells with 500 ms pauses at each cell; d stops the run."
+            "Send start for 7 continuous cells; d stops the run. Front brake: 40 mm."
         );
 
         wifiSerialClient.println(
@@ -467,68 +506,71 @@ bool initSensors() {
   return leftReady && rightReady && frontReady;
 }
 
-bool observe(
-    int &front,
-    int &left,
-    int &right
-) {
-
-    front = frontTof.read();
-
-    bool frontValid =
-        !frontTof.timeoutOccurred() &&
-        frontTof.last_status == 0 &&
-        frontTof.ranging_data.range_status ==
-        VL53L1X::RangeValid;
-
-
-    left =
-        leftTof.readRangeSingleMillimeters();
-
-    bool leftValid =
-        !leftTof.timeoutOccurred() &&
-        leftTof.last_status == 0;
-
-    uint8_t leftStatus =
-        leftTof.readRangeStatus();
-
-    leftValid =
-        leftValid &&
-        leftStatus == 0 &&
-        leftTof.last_status == 0;
-
-
-    right =
-        rightTof.readRangeSingleMillimeters();
-
-    bool rightValid =
-        !rightTof.timeoutOccurred() &&
-        rightTof.last_status == 0;
-
-    uint8_t rightStatus =
-        rightTof.readRangeStatus();
-
-    rightValid =
-        rightValid &&
-        rightStatus == 0 &&
-        rightTof.last_status == 0;
-
-
-    if (!leftValid)
-        left = -1;
-
-    if (!rightValid)
-        right = -1;
-
-    return frontValid;
+void serviceMotionSensors() {
+    mpuYaw.service();
+    if (motionActive && readCommand()==MovementCommand::Stop) {
+        motionStopRequested=true;
+        drive(0,0);
+    }
 }
 
+void waitWithMotionService(unsigned long durationMs) {
+    unsigned long began=millis();
+    do { serviceMotionSensors(); delay(1); } while (millis()-began<durationMs);
+}
+
+int readSideForMotion(VL6180X &sensor) {
+    sensor.writeReg(VL6180X::SYSRANGE__START,0x01);
+    if (sensor.last_status!=0) { sideCommunicationFault=true; return -1; }
+    unsigned long began=millis();
+    while (true) {
+        serviceMotionSensors();
+        if (motionStopRequested) return -1;
+        uint8_t status=sensor.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO);
+        if (sensor.last_status!=0) { sideCommunicationFault=true; return -1; }
+        if ((status&7)==4) break;
+        if (millis()-began>=200) { sideCommunicationFault=true; return -1; }
+        delay(1);
+    }
+    int mm=sensor.readRangeContinuousMillimeters(); // Already ready; no long wait.
+    bool valid=!sensor.timeoutOccurred() && sensor.last_status==0;
+    uint8_t rangeStatus=sensor.readRangeStatus();
+    if (!valid || sensor.last_status!=0) { sideCommunicationFault=true; return -1; }
+    return rangeStatus==0 ? mm : SIDE_NO_TARGET_MM;
+}
+
+bool observe(int &front,int &left,int &right) {
+    sideCommunicationFault=false;
+    unsigned long began=millis();
+    while (true) {
+        serviceMotionSensors();
+        if (motionStopRequested) return false;
+        bool ready=frontTof.dataReady();
+        if (frontTof.last_status!=0) return false;
+        if (ready) break;
+        if (millis()-began>=200) return false;
+        delay(1);
+    }
+    front=frontTof.read(false);
+    bool frontValid=!frontTof.timeoutOccurred() && frontTof.last_status==0 &&
+                    frontTof.ranging_data.range_status==VL53L1X::RangeValid;
+    // Brake before side reads or logging when the front sample requires a stop.
+    if (!frontValid || front <= FRONT_EMERGENCY_STOP_MM) {
+        drive(0, 0);
+        left=right=-1;
+        return frontValid;
+    }
+    left=readSideForMotion(leftTof);
+    right=sideClearanceMm(readSideForMotion(rightTof), RIGHT_TOF_INSET_MM);
+    serviceMotionSensors();
+    return frontValid;
+}
 
 // ============================================================
 // Movement
 // ============================================================
 
-bool runOneCell(unsigned long &stoppedAtMs) {
+bool runForwardDistance() {
     if (!sensorsReady) {
         debugPrintln("REFUSED: ToF initialization failed.");
         return false;
@@ -540,13 +582,15 @@ bool runOneCell(unsigned long &stoppedAtMs) {
     unsigned long lastLeftChange = started, lastRightChange = started;
     unsigned long previousLeft = 0, previousRight = 0, lastLog = started;
     const char *result = "TIMEOUT";
-    bool cellCompleted = false;
+    bool distanceCompleted = false;
     unsigned long previousControlMs = started;
     approachPid.reset();
+    singleWallPid.reset();
+    noWallPid.reset();
 
     while (true) {
         handleWiFiClient();
-        if (readCommand() == MovementCommand::Stop) {
+        if (motionStopRequested || readCommand() == MovementCommand::Stop) {
             result = "ABORTED";
             break;
         }
@@ -561,8 +605,8 @@ bool runOneCell(unsigned long &stoppedAtMs) {
         // Exactly the base sketch's OR stopping rule, with calibrated targets.
         if (cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
                                     RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
-            result = "CELL ENCODER LIMIT REACHED";
-            cellCompleted = true;
+            result = "RUN ENCODER LIMIT REACHED";
+            distanceCompleted = true;
             break;
         }
         if (now - started >= MOVE_TIMEOUT_MS) break;
@@ -576,7 +620,7 @@ bool runOneCell(unsigned long &stoppedAtMs) {
         bool frontValid = observe(front, sideLeft, sideRight);
         // Stop wins over a sensor fault received during a blocking read.
         handleWiFiClient();
-        if (readCommand() == MovementCommand::Stop) {
+        if (motionStopRequested || readCommand() == MovementCommand::Stop) {
             result = "ABORTED";
             break;
         }
@@ -584,10 +628,21 @@ bool runOneCell(unsigned long &stoppedAtMs) {
             result = "INVALID FRONT TOF READING";
             break;
         }
-        // Front obstacle proximity stopping remains disabled as requested.
-        if (sideLeft < 0 && sideRight < 0) {
-            result = "BOTH SIDE TOF READINGS INVALID";
+        if (front <= FRONT_EMERGENCY_STOP_MM) {
+            result = "FRONT EMERGENCY BRAKE: 40 MM OR CLOSER";
             break;
+        }
+        if (sideCommunicationFault) { result="SIDE TOF COMMUNICATION FAILURE"; break; }
+        WallMode mode=wallDetector.update(sideLeft,sideRight);
+        if (mode==WallMode::None && (sideLeft<0 || sideRight<0)) {
+            result="CASE 3 REQUIRES TWO VALID SIDE READINGS"; break;
+        }
+        const bool oneWallMode=mode==WallMode::LeftOnly || mode==WallMode::RightOnly;
+        if (oneWallMode && MPU_YAW_SIGN==0) {
+            result="SET MPU_YAW_SIGN BEFORE CASE 2"; break;
+        }
+        if (oneWallMode && !mpuYaw.healthy()) {
+            result="MPU UNAVAILABLE OR STALE: CASE 2 STOPPED"; break;
         }
 
         // Sensor calls can take time: check distance again before applying PWM.
@@ -596,8 +651,8 @@ bool runOneCell(unsigned long &stoppedAtMs) {
         right = rawRight - startRight;
         if (cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
                                     RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
-            result = "CELL ENCODER LIMIT REACHED";
-            cellCompleted = true;
+            result = "RUN ENCODER LIMIT REACHED";
+            distanceCompleted = true;
             break;
         }
         unsigned long leftRemaining = ticksBeforeBrake(left, LEFT_TARGET_TICKS, BRAKE_LEAD_TICKS);
@@ -610,31 +665,51 @@ bool runOneCell(unsigned long &stoppedAtMs) {
         ForwardWallSettings steering = WALL_SETTINGS;
         steering.baseSpeed = approachSpeed;
         if (steering.slowSpeed > approachSpeed) steering.slowSpeed = approachSpeed;
-        const ForwardMotorCommands commands = forwardWallCommands(sideLeft, sideRight, steering);
+        ForwardMotorCommands commands;
+        float wallError=0, wallPwm=0, mpuPwm=0;
+        float encoderError=0, encoderPwm=0;
+        const float yawRight=mpuYaw.yaw()*MPU_YAW_SIGN;
+        const float rateRight=mpuYaw.rate()*MPU_YAW_SIGN;
+        if (mode==WallMode::Two) {
+            singleWallPid.reset();
+            noWallPid.reset();
+            commands=forwardWallCommands(sideLeft,sideRight,steering);
+        } else if (mode==WallMode::LeftOnly || mode==WallMode::RightOnly) {
+            noWallPid.reset();
+            commands=singleWallPid.update(mode,sideLeft,sideRight,yawRight,rateRight,
+                approachSpeed,SINGLE_WALL_SETTINGS,dt,wallError,wallPwm,mpuPwm);
+        } else {
+            singleWallPid.reset();
+            commands=noWallPid.update(left,right,approachSpeed,
+                NO_WALL_SETTINGS,dt,encoderError,encoderPwm);
+        }
         drive(commands.left, commands.right);
 
         if (millis() - lastLog >= 200) {
             // One complete line reduces the number of WiFi write calls.
-            char telemetry[220];
+            char telemetry[420];
             snprintf(telemetry, sizeof(telemetry),
-                "ticks L/R: %lu/%lu | mm F/L/R: %d/%d/%d | command L/R: %d/%d | remaining ticks: %lu | distance PID PWM: %d",
-                left, right, front, sideLeft, sideRight, commands.left, commands.right, remaining, approachSpeed);
+                "ticks L/R: %lu/%lu | mm F/L/R (R corrected): %d/%d/%d | command L/R: %d/%d | remaining ticks: %lu | distance PID PWM: %d | case: %s | yaw: %.2f | wall error: %.1f | wall PID PWM: %.2f | encoder error/PWM: %.1f/%.2f | MPU trim: %.2f",
+                left, right, front, sideLeft, sideRight, commands.left, commands.right, remaining, approachSpeed,
+                mode==WallMode::Two?"two":(mode==WallMode::LeftOnly?"left+MPU":(mode==WallMode::RightOnly?"right+MPU":"none:encoder")),
+                yawRight,wallError,wallPwm,encoderError,encoderPwm,mpuPwm);
             debugPrintln(telemetry);
             lastLog = millis();
         }
-        delay(10); // Same movement-loop delay as main.ino.
+        waitWithMotionService(10); // Maintain the tested MPU sampling cadence.
     }
 
     drive(0, 0); // Always brake both wheels together.
-    stoppedAtMs = millis();
     unsigned long brakeLeft, brakeRight;
     readTicks(brakeLeft, brakeRight);
     approachPid.reset();
-    delay(100); // Settling time counts toward the 500 ms cell pause.
+    singleWallPid.reset();
+    noWallPid.reset();
+    waitWithMotionService(100); // Sample yaw and residual movement after braking.
     unsigned long endLeft, endRight;
     readTicks(endLeft, endRight);
     debugPrint(result);
-    debugPrint(" | per-cell limits L/R: "); debugPrint(LEFT_TARGET_TICKS);
+    debugPrint(" | run limits L/R: "); debugPrint(LEFT_TARGET_TICKS);
     debugPrint('/'); debugPrint(RIGHT_TARGET_TICKS);
     debugPrint(" | final L/R: "); debugPrint(endLeft - startLeft);
     debugPrint('/'); debugPrint(endRight - startRight);
@@ -643,38 +718,18 @@ bool runOneCell(unsigned long &stoppedAtMs) {
     debugPrint(" | ticks after brake L/R: "); debugPrint(endLeft - brakeLeft);
     debugPrint('/'); debugPrint(endRight - brakeRight);
     debugPrint(" | elapsed ms: "); debugPrintln(millis() - started);
-    debugPrintln("Both motors stop at the first encoder limit. Measure actual cell travel against 180 mm.");
-    return cellCompleted;
+    debugPrintln("Both motors stop at the first encoder limit. Measure actual full-run travel against 1260 mm.");
+    return distanceCompleted;
 }
 
 void runMove() {
-    for (int cell = 1; cell <= FORWARD_CELLS; ++cell) {
-        // Stop wins even at the transition between cells; extra starts are ignored.
-        handleWiFiClient();
-        if (readCommand() == MovementCommand::Stop) {
-            drive(0, 0);
-            debugPrintln("ABORTED: remaining cells cancelled.");
-            return;
-        }
-        debugPrint("Moving cell "); debugPrint(cell);
-        debugPrint('/'); debugPrintln(FORWARD_CELLS);
-        unsigned long stoppedAtMs = 0;
-        if (!runOneCell(stoppedAtMs)) {
-            debugPrintln("Run stopped; remaining cells cancelled.");
-            return;
-        }
-        if (cell == FORWARD_CELLS) break;
-        debugPrintln("Cell complete. Pausing 500 ms, then continuing automatically.");
-        // Count the existing settling/reporting time toward the half-second stop.
-        do {
-            handleWiFiClient();
-            if (readCommand() == MovementCommand::Stop) {
-                drive(0, 0);
-                debugPrintln("ABORTED during pause: remaining cells cancelled.");
-                return;
-            }
-            delay(1);
-        } while (millis() - stoppedAtMs < CELL_PAUSE_MS);
+    motionStopRequested=false;
+    mpuYaw.reset();
+    wallDetector.reset();
+    debugPrintln("Moving 7 cells continuously (1260 mm); front brake at 40 mm.");
+    if (!runForwardDistance()) {
+        debugPrintln("Run stopped; send start when ready for a new run.");
+        return;
     }
     debugPrintln("All 7 cells completed. Robot remains stopped.");
 }
@@ -766,6 +821,10 @@ void setup() {
 
     sensorsReady =
         initSensors();
+    debugPrintln("MPU6500 calibration: keep the robot completely still.");
+    bool mpuReady=mpuYaw.begin();
+    debugPrintln(mpuReady?"MPU6500 ready (tested Kalman filter).":"MPU failed: only two-wall mode available.");
+    if (MPU_YAW_SIGN==0) debugPrintln("Case 2 needs MPU_YAW_SIGN: +1 for right-positive yaw, -1 for right-negative yaw.");
 
     digitalWrite(
         MOTOR_EN,
@@ -797,7 +856,7 @@ void setup() {
     );
 
     debugPrint(
-        ", per-cell target ticks L/R: "
+        ", run target ticks L/R: "
     );
 
     debugPrint(
@@ -816,7 +875,7 @@ void setup() {
     );
 
     debugPrintln(
-        "Front obstacle proximity stop disabled; invalid readings still stop the run."
+        "Front emergency brake at 40 mm or closer; invalid readings also stop the run."
     );
 
     debugPrintln(
@@ -835,7 +894,7 @@ void setup() {
 
 
     debugPrintln(
-        "Ready. Send start for 7 cells, pausing 500 ms after each cell; d cancels the run."
+        "Ready. Send start for 7 continuous cells; d cancels the run."
     );
 
 
@@ -851,6 +910,7 @@ void loop() {
 
     // One start runs seven cells with automatic half-second stops between cells.
     handleWiFiClient();
+    mpuYaw.service();
     MovementCommand command = readCommand();
     if (command == MovementCommand::Stop) {
         drive(0, 0);
@@ -859,7 +919,9 @@ void loop() {
         debugPrintln("Stopped. Send start for a fresh seven-cell run.");
     } else if (command == MovementCommand::Start) {
         debugPrintln("Start received.");
+        motionActive=true;
         runMove();
+        motionActive=false;
         discardPendingCommands();
         debugPrintln("Run ended. Staying stopped; send start for a new seven-cell run.");
     }

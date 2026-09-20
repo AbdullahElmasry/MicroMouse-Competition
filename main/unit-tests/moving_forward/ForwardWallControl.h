@@ -1,5 +1,12 @@
 #pragma once
 
+// Convert a recessed sensor's range to clearance from the chassis edge.
+// Preserve invalid samples; a valid range inside the offset means zero clearance.
+inline int sideClearanceMm(int rangeMm, int insetMm) {
+  if (rangeMm < 0) return -1;
+  return rangeMm > insetMm ? rangeMm - insetMm : 0;
+}
+
 struct ForwardWallSettings {
   int baseSpeed;
   int slowSpeed;

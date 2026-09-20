@@ -3,6 +3,14 @@
 #include <stdio.h>
 
 int main() {
+  assert(sideClearanceMm(50, 10) == 40);
+  assert(sideClearanceMm(49, 10) == 39);
+  assert(sideClearanceMm(10, 10) == 0);
+  assert(sideClearanceMm(5, 10) == 0);
+  assert(sideClearanceMm(-1, 10) == -1);
+  const ForwardWallSettings correctedSettings = {70, 30, 40, 40};
+  assert(forwardWallCommands(40, sideClearanceMm(50, 10), correctedSettings).right == 70);
+  assert(forwardWallCommands(40, sideClearanceMm(49, 10), correctedSettings).right == 30);
   const ForwardWallSettings settings = {70, 30, 40, 50};
   struct Example { int leftMm, rightMm, leftCommand, rightCommand; };
   const Example examples[] = {
