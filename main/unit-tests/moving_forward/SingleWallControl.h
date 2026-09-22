@@ -5,18 +5,28 @@
 enum class WallMode { Two, LeftOnly, RightOnly, None };
 class WallModeDetector {
  public:
-  void reset() { left_=right_=false; }
+  // Distances are chassis clearances (right inset already subtracted).
+  static constexpr int ACQUIRE_MM = 80;
+  static constexpr int RETAIN_MM = 100;
+  static constexpr int CONFIRM_SAMPLES = 3;
+  void reset() { left_=right_=false; leftCount_=rightCount_=0; }
   WallMode update(int left,int right) {
-    left_=present(left,left_); right_=present(right,right_);
+    left_=present(left,left_,leftCount_); right_=present(right,right_,rightCount_);
     if (left_ && right_) return WallMode::Two;
     if (left_) return WallMode::LeftOnly;
     if (right_) return WallMode::RightOnly;
     return WallMode::None;
   }
  private:
-  // Hysteresis prevents repeated mode changes at the detection boundary.
-  bool present(int mm,bool previous) { return mm>=0 && mm<(previous?140:120); }
+  bool present(int mm,bool previous,int &count) {
+    if (mm<0 || mm>=RETAIN_MM) { count=0; return false; }
+    if (previous) return true;
+    if (mm>=ACQUIRE_MM) { count=0; return false; }
+    if (count<CONFIRM_SAMPLES) ++count;
+    return count>=CONFIRM_SAMPLES;
+  }
   bool left_=false,right_=false;
+  int leftCount_=0,rightCount_=0;
 };
 
 struct SingleWallSettings {
@@ -48,7 +58,7 @@ class SingleWallController {
   const int slow=base<s.slowSpeed?base:s.slowSpeed;
   const float available=base-slow;
   if (wallError!=0) {
-    // Preserve the working direction: positive slows LEFT, negative slows RIGHT.
+    // Preserve the working direction: positive slows physical RIGHT, negative slows physical LEFT.
     const float limit=available<s.maximumWallPwm?available:s.maximumWallPwm;
     const float low=wallError>0?0:-limit, high=wallError>0?limit:0;
     if (havePrevious_ && wallError*previousError_<0) integral_=0;
@@ -62,8 +72,8 @@ class SingleWallController {
     wallPwm=output<low?low:(output>high?high:output);
     previousError_=wallError;
     havePrevious_=true;
-    if (wallPwm>0) commands.left=(int)lroundf(base-wallPwm);
-    else commands.right=(int)lroundf(base+wallPwm);
+    if (wallPwm>0) commands.right=(int)lroundf(base-wallPwm);
+    else commands.left=(int)lroundf(base+wallPwm);
     return commands; // MPU cannot override a wall-distance correction.
   }
   clearPid(); // No stored integral/derivative inside the distance tolerance band.
@@ -73,8 +83,8 @@ class SingleWallController {
   float correction=clampSingleWall(s.headingKp*headingError-s.yawRateKd*rateRightDps,s.maximumMpuPwm);
   correction=clampSingleWall(correction,available);
   mpuPwm=correction;
-  if (correction>0) commands.left=(int)lroundf(base-correction);
-  else commands.right=(int)lroundf(base+correction);
+  if (correction>0) commands.right=(int)lroundf(base-correction);
+  else commands.left=(int)lroundf(base+correction);
   return commands;
   }
  private:

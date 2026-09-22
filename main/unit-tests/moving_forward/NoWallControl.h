@@ -17,6 +17,12 @@ struct NoWallSettings {
   NoWallPidSettings encoderPid;
 };
 
+inline int noWallApproachSpeed(int approachSpeed, int minimumBase, int cruise) {
+  if (approachSpeed <= 0) return 0;
+  const int floor = minimumBase < cruise ? minimumBase : cruise;
+  return approachSpeed < floor ? floor : approachSpeed;
+}
+
 class NoWallController {
  public:
   void reset() {
@@ -50,8 +56,8 @@ class NoWallController {
     const float leftCells = (leftTicks - startLeft_) / settings.leftTicksPerCell;
     const float rightCells = (rightTicks - startRight_) / settings.rightTicksPerCell;
     const float averageTicks = (settings.leftTicksPerCell + settings.rightTicksPerCell) * 0.5f;
-    // Positive means the left encoder has travelled farther. Hardware logs show
-    // that reducing the named RIGHT command corrects this physical drift.
+    // User verified each encoder belongs to its same-named physical motor.
+    // Positive means LEFT travelled farther: slow LEFT to reduce the error.
     encoderError = (leftCells - rightCells) * averageTicks;
 
     const int minimum = baseSpeed < settings.minimumSpeed ? baseSpeed : settings.minimumSpeed;
@@ -61,8 +67,8 @@ class NoWallController {
     encoderPwm = pid(encoderError, dt, settings.encoderPid, pidLimit,
         encoderIntegral_, encoderPreviousError_, encoderPreviousValid_);
     ForwardMotorCommands commands = {baseSpeed, baseSpeed};
-    if (encoderPwm > 0) commands.right = (int)lroundf(baseSpeed - encoderPwm);
-    else if (encoderPwm < 0) commands.left = (int)lroundf(baseSpeed + encoderPwm);
+    if (encoderPwm > 0) commands.left = (int)lroundf(baseSpeed - encoderPwm);
+    else if (encoderPwm < 0) commands.right = (int)lroundf(baseSpeed + encoderPwm);
     return commands;
   }
 

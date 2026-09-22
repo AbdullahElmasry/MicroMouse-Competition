@@ -11,6 +11,11 @@ MovementCommand send(MovementCommands &parser, const char *text, uint32_t now) {
 int main() {
   MovementCommands usb, wifi;
   assert(usb.poll(3000) == MovementCommand::None); // No automatic start.
+  assert(send(usb,"s\n",0)==MovementCommand::Start);
+  assert(send(wifi,"S",0)==MovementCommand::None);
+  assert(wifi.poll(99)==MovementCommand::None);
+  assert(wifi.poll(100)==MovementCommand::Start);
+  assert(send(wifi,"sd",0)==MovementCommand::Stop);
   assert(send(usb, "sta", 1) == MovementCommand::None);
   assert(usb.poll(150) == MovementCommand::None); // Human typing / delayed packet.
   assert(send(usb, "rt\r\n", 200) == MovementCommand::Start);

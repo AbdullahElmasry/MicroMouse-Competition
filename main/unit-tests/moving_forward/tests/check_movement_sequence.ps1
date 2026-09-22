@@ -11,18 +11,23 @@ $harness = @'
 #include "MovementCommands.h"
 #include "SingleWallControl.h"
 #include "NoWallControl.h"
+#include "TofFilter.h"
+TofFilter frontFilter, leftFilter, rightFilter;
+int tofFrontFiltered=-1, tofLeftRaw=-1;
 #include <assert.h>
 #include <stdio.h>
-constexpr unsigned long LEFT_TARGET_TICKS=4359, RIGHT_TARGET_TICKS=4335;
+constexpr unsigned long LEFT_TARGET_TICKS=4314, RIGHT_TARGET_TICKS=4322;
 constexpr unsigned long MOVE_TIMEOUT_MS=105000, STALL_TIMEOUT_MS=1500;
 constexpr int FRONT_EMERGENCY_STOP_MM=40;
-constexpr ForwardWallSettings WALL_SETTINGS={70,30,40,40};
+constexpr int NO_WALL_MIN_BASE_PWM=70, FORWARD_SPEED=140;
+constexpr TwoWallPidSettings TWO_WALL_PID_SETTINGS={3.6f,30,1.4f,0,5.5f,40};
 constexpr CellApproachSettings APPROACH_SETTINGS={0.24f,0.01f,0.01f,300,70,35};
 constexpr unsigned long BRAKE_LEAD_TICKS=10;
 CellApproachController approachPid(APPROACH_SETTINGS);
-const SingleWallSettings SINGLE_WALL_SETTINGS={40,40,3.6f,30,1,0.10f,5,1.5f,0.05f,0.08f,40};
+TwoWallPidController twoWallPid;
+const SingleWallSettings SINGLE_WALL_SETTINGS={40,40,3.6f,30,1,0.10f,5,3.5f,0,4.2f,40};
 SingleWallController singleWallPid;
-const NoWallSettings NO_WALL_SETTINGS={4359.0f/7.0f,4334.5f/7.0f,30,{1,0.10f,0,40}};
+const NoWallSettings NO_WALL_SETTINGS={4314.0f/7.0f,4321.5f/7.0f,60,{1.7f,0.10f,0,40}};
 NoWallController noWallPid;
 float MPU_YAW_SIGN=1;
 WallModeDetector wallDetector;
@@ -45,6 +50,7 @@ void delay(unsigned long ms) {
 template<class T> void debugPrint(const T&) {}
 template<class T> void debugPrintln(const T&) {}
 void debugPrintln() {}
+void reportMovementConfig() {}
 void handleWiFiClient() {}
 void serviceMotionSensors() {}
 void waitWithMotionService(unsigned long ms) { delay(ms); }
@@ -63,7 +69,7 @@ MovementCommand readCommand() {
   if (scenario==2 && leftCommand && leftTicks>=100) return MovementCommand::Stop;
   return MovementCommand::None;
 }
-bool observe(int &front, int &left, int &right) {
+bool observe(int &front, int &left, int &right, int &rightRaw) {
   delay(10);
   front=130; left=44; right=55;
   if (scenario==11) front=40;
@@ -79,6 +85,7 @@ bool observe(int &front, int &left, int &right) {
   if (scenario==6) { left=200; right=40; }
   if (scenario==7) { left=200; right=200; }
   if (scenario==10 && (leftTicks/600)%2==1) { left=40; right=-1; }
+  rightRaw=right<0?-1:right+10;
   return true;
 }
 '@
@@ -91,7 +98,7 @@ int main() {
     runMove();
     assert(leftCommand==0 && rightCommand==0);
     if (scenario==0 || scenario==5 || scenario==6 || scenario==10 || scenario==13 || scenario==15 || scenario==16 || scenario==17) { assert(starts==1 && stops==1); assert(leftTicks>=LEFT_TARGET_TICKS-BRAKE_LEAD_TICKS || rightTicks>=RIGHT_TARGET_TICKS-BRAKE_LEAD_TICKS); }
-    else if (scenario==8 || scenario==9 || scenario==11 || scenario==12) assert(starts==0 && stops==0);
+    else if (scenario==11 || scenario==12) assert(starts==0 && stops==0);
     else if (scenario==7) assert(starts==1 && stops==1);
     else assert(starts==1 && stops==1);
   }

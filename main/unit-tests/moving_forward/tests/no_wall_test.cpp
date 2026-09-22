@@ -5,7 +5,7 @@
 
 int main() {
   const NoWallSettings settings = {
-      4359.0f/7.0f, 4334.5f/7.0f, 30, {1, 0.10f, 0, 40}
+      4314.0f/7.0f, 4321.5f/7.0f, 30, {1, 0.10f, 0, 40}
   };
   NoWallController controller;
   float encoderError, encoderPwm;
@@ -14,16 +14,16 @@ int main() {
       encoderError,encoderPwm);
   assert(commands.left==70 && commands.right==70); // Entry captures both references.
 
-  commands=controller.update(5359,5334,70,settings,0.05f,
+  commands=controller.update(5314,5322,70,settings,0.05f,
       encoderError,encoderPwm);
   assert(fabsf(encoderError)<0.6f); // Within one integer tick of equal travel.
 
-  commands=controller.update(5379,5334,70,settings,0.05f,
+  commands=controller.update(5334,5322,70,settings,0.05f,
       encoderError,encoderPwm);
-  assert(encoderError>0 && encoderPwm>0 && commands.right<70 && commands.left==70);
+  assert(encoderError>0 && encoderPwm>0 && commands.left<70 && commands.right==70);
   const float initialPwm=encoderPwm;
   for(int i=0;i<20;++i) {
-    commands=controller.update(5379,5334,70,settings,0.05f,
+    commands=controller.update(5334,5322,70,settings,0.05f,
         encoderError,encoderPwm);
   }
   assert(encoderPwm>initialPwm); // Ki corrects a persistent travel mismatch.
@@ -31,7 +31,7 @@ int main() {
   controller.reset();
   controller.update(0,0,70,settings,0.05f,encoderError,encoderPwm);
   commands=controller.update(0,20,70,settings,0.05f,encoderError,encoderPwm);
-  assert(encoderError<0 && encoderPwm<0 && commands.left<70 && commands.right==70);
+  assert(encoderError<0 && encoderPwm<0 && commands.right<70 && commands.left==70);
 
   assert(fabsf(settings.encoderPid.ki-0.10f)<0.0001f);
 
@@ -40,8 +40,32 @@ int main() {
   controller.update(0,0,35,settings,0.05f,encoderError,encoderPwm);
   for(int i=0;i<1000;++i)
     controller.update(100,0,35,settings,0.05f,encoderError,encoderPwm);
-  controller.update(623,619,70,settings,0.05f,encoderError,encoderPwm);
+  controller.update(616,617,70,settings,0.05f,encoderError,encoderPwm);
   assert(fabsf(encoderPwm)<0.6f);
 
-  puts("PASS: encoder-only case 3 uses manual calibration, Ki correction, and anti-windup");
+  assert(noWallApproachSpeed(35,70,140)==70);
+  assert(noWallApproachSpeed(140,70,140)==140);
+  assert(noWallApproachSpeed(35,70,50)==50);
+  assert(noWallApproachSpeed(0,70,140)==0);
+  const NoWallSettings rolling={4314.0f/7.0f,4321.5f/7.0f,60,{1.7f,0.10f,0,40}};
+  controller.reset();
+  controller.update(0,0,70,rolling,0.046f,encoderError,encoderPwm);
+  commands=controller.update(4223,4097,70,rolling,0.046f,encoderError,encoderPwm);
+  assert(commands.left==60 && commands.right==70);
+  // Same-named motor/encoder plant: reducing PWM reduces that wheel's travel.
+  // A pre-existing mismatch must shrink in both directions (negative feedback).
+  for (int ahead=0; ahead<2; ++ahead) {
+    controller.reset();
+    controller.update(0,0,140,rolling,0.03f,encoderError,encoderPwm);
+    float leftPos=ahead==0?60.0f:0.0f;
+    float rightPos=ahead==1?60.0f:0.0f;
+    for (int step=0;step<200;++step) {
+      commands=controller.update((unsigned long)lroundf(leftPos),
+          (unsigned long)lroundf(rightPos),140,rolling,0.03f,encoderError,encoderPwm);
+      leftPos+=commands.left*0.03f*rolling.leftTicksPerCell/620.0f;
+      rightPos+=commands.right*0.03f*rolling.rightTicksPerCell/620.0f;
+    }
+    assert(fabsf(encoderError)<5.0f);
+  }
+  puts("PASS: encoder-only case 3 calibration, Ki, anti-windup and rolling floors");
 }

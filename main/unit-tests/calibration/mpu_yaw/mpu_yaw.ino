@@ -1,47 +1,63 @@
 #include <Wire.h>
-#include <MPU6500_WE.h>
 #include <math.h>
 
 #define I2C_SDA 21
 #define I2C_SCL 22
-#define MPU6500_ADDR 0x68
+#define MPU6050_ADDR 0x68
 
-MPU6500_WE myMPU6500 = MPU6500_WE(MPU6500_ADDR);
+float gyroZBias = 0.0f;
 
-// ==========================================
-// فئة فلتر كالمان المبسط (Simple 1D Kalman Filter)
-// ==========================================
-class SimpleKalmanFilter {
-  private:
-    float _err_measure;
-    float _err_estimate;
-    float _q;
-    float _current_estimate;
-    float _last_estimate;
-    float _kalman_gain;
-    
-  public:
-    SimpleKalmanFilter(float mea_e, float est_e, float q_var) {
-      _err_measure = mea_e;
-      _err_estimate = est_e;
-      _q = q_var;
-      _current_estimate = 0.0;
-      _last_estimate = 0.0;
-    }
-    
-    float updateEstimate(float mea) {
-      _kalman_gain = _err_estimate / (_err_estimate + _err_measure);
-      _current_estimate = _last_estimate + _kalman_gain * (mea - _last_estimate);
-      _err_estimate =  (1.0 - _kalman_gain) * _err_estimate + fabs(_last_estimate - _current_estimate) * _q;
-      _last_estimate = _current_estimate;
-      return _current_estimate;
-    }
-};
+bool readMPU6050(uint8_t reg, uint8_t *data, uint8_t count) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom((uint8_t)MPU6050_ADDR, count) != count) {
+    return false;
+  }
+  for (uint8_t i = 0; i < count; ++i) data[i] = Wire.read();
+  return true;
+}
 
-// إنشاء فلتر لمحور Z
-SimpleKalmanFilter kalmanGyroZ(2.0, 2.0, 0.01);
+bool writeMPU6050(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readGyroZ(float &rate) {
+  uint8_t data[2];
+  if (!readMPU6050(0x47, data, 2)) return false;
+  int16_t raw = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+  // MPU6050 sensitivity at +/-500 degrees/second.
+  rate = raw / 65.5f;
+  return true;
+}
+
+bool initMPU6050() {
+  uint8_t identity;
+  if (!readMPU6050(0x75, &identity, 1) || identity != 0x68) return false;
+  if (!writeMPU6050(0x6B, 0x01)) return false; // Wake, X gyro PLL clock.
+  delay(100);
+  if (!writeMPU6050(0x1A, 0x06) || // DLPF: 5 Hz, matching previous setting.
+      !writeMPU6050(0x1B, 0x08)) return false; // +/-500 degrees/second.
+  delay(100);
+
+  Serial.println("Calibrating... Please keep the robot completely still.");
+  float sum = 0.0f;
+  for (int i = 0; i < 200; ++i) {
+    float rate;
+    if (!readGyroZ(rate)) return false;
+    sum += rate;
+    delay(10);
+  }
+  gyroZBias = sum / 200.0f;
+  Serial.println("Calibration Done!");
+  return true;
+}
 
 unsigned long prevTime = 0;
+unsigned long lastLogTime = 0;
 float yawAngle = 0.0; 
 
 void setup() {
@@ -50,20 +66,15 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  if (!myMPU6500.init()) {
-    Serial.println("MPU6500 Error! Check wiring.");
+  if (!initMPU6050()) {
+    Serial.println("MPU6050 Error! Check wiring and I2C address.");
     while (1) delay(10);
   }
   
-  Serial.println("Calibrating... Please keep the robot completely still.");
-  myMPU6500.autoOffsets();
-  Serial.println("Calibration Done!");
-  
-  myMPU6500.enableGyrDLPF(); 
-  myMPU6500.setGyrDLPF(MPU6500_DLPF_6); 
-  myMPU6500.setGyrRange(MPU6500_GYRO_RANGE_500); 
-  
+  Serial.println("MPU6050 yaw ready.");
+  Serial.println("Corrected rate | Applied rate | Yaw angle");
   prevTime = millis();
+  lastLogTime = prevTime;
 }
 
 void loop() {
@@ -72,24 +83,35 @@ void loop() {
   float dt = (currentTime - prevTime) / 1000.0;
   prevTime = currentTime;
 
-  xyzFloat gyr = myMPU6500.getGyrValues();
-
-  // إهمال القراءات الصغيرة جداً لمنع تراكم الأخطاء (Drift)
-  float rawGyroZ = gyr.z;
-  if (fabs(rawGyroZ) < 0.5) { 
-    rawGyroZ = 0.0; 
+  float gyroZ;
+  if (!readGyroZ(gyroZ)) {
+    Serial.println("MPU6050 read failed. Reset to recalibrate yaw.");
+    while (1) delay(10);
   }
 
-  // تمرير القراءة عبر فلتر كالمان
-  float filteredGyroZ = kalmanGyroZ.updateEstimate(rawGyroZ);
+  // إهمال القراءات الصغيرة جداً لمنع تراكم الأخطاء (Drift)
+  const float correctedGyroZ = gyroZ - gyroZBias;
+  float appliedGyroZ = correctedGyroZ;
+  if (fabs(appliedGyroZ) < 0.5) {
+    appliedGyroZ = 0.0;
+  }
 
   // حساب زاوية الروبوت
-  yawAngle += (filteredGyroZ * dt);
+  yawAngle += (appliedGyroZ * dt);
 
   // طباعة الزاوية الحالية للروبوت بشكل مقروء وواضح
-  Serial.print("Current Angle (Yaw): ");
-  Serial.print(yawAngle);
-  Serial.println(" degrees");
+  // Log at 20 Hz without slowing the gyro updates to that rate.
+  // appliedGyroZ is the rate integrated into yaw after the deadband.
+  if (currentTime - lastLogTime >= 50) {
+    lastLogTime = currentTime;
+    Serial.print("Rate: ");
+    Serial.print(correctedGyroZ, 3);
+    Serial.print(" deg/s | Applied: ");
+    Serial.print(appliedGyroZ, 3);
+    Serial.print(" deg/s | Yaw: ");
+    Serial.print(yawAngle, 2);
+    Serial.println(" degrees");
+  }
 
   delay(10); 
 }

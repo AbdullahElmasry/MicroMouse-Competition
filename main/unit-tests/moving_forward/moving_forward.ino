@@ -8,6 +8,7 @@
 #include "NoWallControl.h"
 #include "MpuYaw.h"
 #include "MovementCommands.h"
+#include "TofFilter.h"
 
 // ============================================================
 // WiFi configuration
@@ -25,20 +26,21 @@ WiFiClient wifiSerialClient;
 // Hardware configuration
 // ============================================================
 
-constexpr int LEFT_IN1 = 25, LEFT_IN2 = 26;
-constexpr int RIGHT_IN1 = 27, RIGHT_IN2 = 14, MOTOR_EN = 23;
+// Confirmed by isolated motor test: 27/14 drives physical LEFT, 25/26 RIGHT.
+constexpr int LEFT_IN1 = 27, LEFT_IN2 = 14;
+constexpr int RIGHT_IN1 = 25, RIGHT_IN2 = 26, MOTOR_EN = 23;
 
 constexpr int LEFT_ENCODER = 33, RIGHT_ENCODER = 35;
 
 constexpr int LEFT_XSHUT = 4, RIGHT_XSHUT = 5, FRONT_XSHUT = 16;
 
 // Two hand-pushed trials over 7 cells (1260 mm): L/R
-// 4373/4344, 4345/4325.
+// 4363/4360, 4265/4283. Both trials were confirmed as 1260 mm.
 constexpr float LEFT_TICKS_PER_CELL =
-    ((4373.0f + 4345.0f) / 2.0f) / 7.0f;
+    ((4363.0f + 4265.0f) / 2.0f) / 7.0f;
 
 constexpr float RIGHT_TICKS_PER_CELL =
-    ((4344.0f + 4325.0f) / 2.0f) / 7.0f;
+    ((4360.0f + 4283.0f) / 2.0f) / 7.0f;
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 7;
@@ -51,23 +53,24 @@ constexpr unsigned long RIGHT_TARGET_TICKS =
     (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 4359 &&
-    RIGHT_TARGET_TICKS == 4335,
+    LEFT_TARGET_TICKS == 4314 &&
+    RIGHT_TARGET_TICKS == 4322,
     "Check continuous seven-cell targets from calibration"
 );
 
 constexpr int FORWARD_TARGET_MM =
     CELL_LENGTH_MM * FORWARD_CELLS;
 
-constexpr int FORWARD_SPEED = 160;         //////////// speeeed
+constexpr int FORWARD_SPEED = 140;         //////////// speeeed
 
 constexpr unsigned long MOVE_TIMEOUT_MS =
     105000UL; // Whole seven-cell run; stall timeout remains 1500 ms.
     
 constexpr unsigned long STALL_TIMEOUT_MS = 1500;
 
-constexpr float RIGHT_FACTOR = 0.99f;
-constexpr float LEFT_FACTOR = 1.0f;
+// Keep each factor on its original electrical output while fixing side labels.
+constexpr float RIGHT_FACTOR = 1.0f;
+constexpr float LEFT_FACTOR = 0.99f;
 
 // Working main.ino behavior: asymmetric thresholds and slow the same named motor.
 constexpr int WALL_SLOW_SPEED = 30;
@@ -103,10 +106,10 @@ static_assert(BRAKE_LEAD_TICKS < LEFT_TARGET_TICKS && BRAKE_LEAD_TICKS < RIGHT_T
 CellApproachController approachPid(APPROACH_SETTINGS);
 // +1 if MPU yaw increases on a physical right turn; -1 if it decreases.
 // 0 leaves one-wall motion disabled until mounting direction is confirmed.
-constexpr float MPU_YAW_SIGN = -1.0f;
-constexpr float SINGLE_WALL_KP = 1.4f;
+constexpr float MPU_YAW_SIGN = 1.0f;
+constexpr float SINGLE_WALL_KP = 6.5f;
 constexpr float SINGLE_WALL_KI = 0.0f;
-constexpr float SINGLE_WALL_KD = 5.5f;
+constexpr float SINGLE_WALL_KD = 4.0f;
 constexpr float SINGLE_WALL_MAX_PWM = 40.0f;
 constexpr SingleWallSettings SINGLE_WALL_SETTINGS = {
     (float)LEFT_WALL_THRESHOLD_MM, (float)RIGHT_WALL_THRESHOLD_MM, 3.6f,
@@ -116,13 +119,16 @@ constexpr SingleWallSettings SINGLE_WALL_SETTINGS = {
 };
 SingleWallController singleWallPid;
 // Case 3 uses the manual 7-cell calibration to compare travelled distance.
-constexpr float NO_WALL_ENCODER_KP = 1.0f;
+constexpr float NO_WALL_ENCODER_KP = 1.7f;
 constexpr float NO_WALL_ENCODER_KI = 0.10f;
 constexpr float NO_WALL_ENCODER_KD = 0.0f;
 constexpr float NO_WALL_ENCODER_MAX_PWM = 40.0f;
+// Initial rolling floors: the logged 35/30 commands stalled both encoders.
+constexpr int NO_WALL_MIN_BASE_PWM = 70;
+constexpr int NO_WALL_MIN_MOTOR_PWM = 60;
 constexpr NoWallSettings NO_WALL_SETTINGS = {
     LEFT_TICKS_PER_CELL, RIGHT_TICKS_PER_CELL,
-    WALL_SLOW_SPEED,
+    NO_WALL_MIN_MOTOR_PWM,
     {NO_WALL_ENCODER_KP, NO_WALL_ENCODER_KI,
      NO_WALL_ENCODER_KD, NO_WALL_ENCODER_MAX_PWM}
 };
@@ -143,6 +149,11 @@ volatile unsigned long rightTicks = 0;
 VL6180X leftTof;
 VL6180X rightTof;
 VL53L1X frontTof;
+constexpr int SIDE_CONVERGENCE_MS = 30;
+constexpr unsigned long FRONT_TIMING_BUDGET_US = 20000;
+constexpr int FRONT_PERIOD_MS = 25;
+TofFilter frontFilter, leftFilter, rightFilter;
+int tofFrontRaw = -1, tofLeftRaw = -1, tofFrontFiltered = -1;
 
 bool sensorsReady = false;
 MovementCommands usbCommands;
@@ -248,7 +259,7 @@ void handleWiFiClient() {
         );
 
         wifiSerialClient.println(
-            "Send start for 7 continuous cells; d stops the run. Front brake: 40 mm."
+            "Send s for 7 continuous cells; d stops the run. Front brake: 40 mm."
         );
 
         wifiSerialClient.println(
@@ -424,7 +435,7 @@ void drive(int left, int right) {
         LEFT_IN2,
         left,
         LEFT_FACTOR,
-        false
+        true
     );
 
     motor(
@@ -432,7 +443,7 @@ void drive(int left, int right) {
         RIGHT_IN2,
         right,
         RIGHT_FACTOR,
-        true
+        false
     );
 }
 
@@ -476,6 +487,8 @@ bool initSensors() {
   leftTof.setAddress(0x30);
   uint8_t leftAddressStatus = leftTof.last_status;
   leftTof.setTimeout(200);
+  leftTof.writeReg(VL6180X::SYSRANGE__MAX_CONVERGENCE_TIME, SIDE_CONVERGENCE_MS);
+  bool leftTimingOk = leftTof.last_status == 0;
 
   digitalWrite(RIGHT_XSHUT, HIGH);
   delay(50);
@@ -486,15 +499,18 @@ bool initSensors() {
   rightTof.setAddress(0x31);
   uint8_t rightAddressStatus = rightTof.last_status;
   rightTof.setTimeout(200);
+  rightTof.writeReg(VL6180X::SYSRANGE__MAX_CONVERGENCE_TIME, SIDE_CONVERGENCE_MS);
+  bool rightTimingOk = rightTof.last_status == 0;
 
   digitalWrite(FRONT_XSHUT, HIGH);
   delay(50);
   bool frontInitOk = frontTof.init();
-  bool frontModeOk = frontTof.setDistanceMode(VL53L1X::Medium);
+  bool frontModeOk = frontTof.setDistanceMode(VL53L1X::Short);
+  bool frontTimingOk = frontTof.setMeasurementTimingBudget(FRONT_TIMING_BUDGET_US);
   frontTof.setAddress(0x32);
   uint8_t frontAddressStatus = frontTof.last_status;
   frontTof.setTimeout(200);
-  frontTof.startContinuous(30);
+  frontTof.startContinuous(FRONT_PERIOD_MS);
   uint8_t frontStartStatus = frontTof.last_status;
 
   reportTofStep("LEFT", "init", leftInitStatus);
@@ -511,7 +527,10 @@ bool initSensors() {
   reportTofStep("FRONT", "startContinuous", frontStartStatus);
   frontReady = reportTofStep("FRONT", "probe 0x32", probeTof(0x32)) && frontInitOk;
   debugPrintln("Address ACK allows diagnostic reads; check range validity below.");
-  return leftReady && rightReady && frontReady;
+  debugPrintln(leftTimingOk && rightTimingOk && frontTimingOk ?
+      "ToF fast timing configured." : "ToF timing configuration FAILED.");
+  return leftReady && rightReady && frontReady && frontModeOk &&
+      leftTimingOk && rightTimingOk && frontTimingOk;
 }
 
 void serviceMotionSensors() {
@@ -528,8 +547,7 @@ void waitWithMotionService(unsigned long durationMs) {
 }
 
 int readSideForMotion(VL6180X &sensor) {
-    sensor.writeReg(VL6180X::SYSRANGE__START,0x01);
-    if (sensor.last_status!=0) { sideCommunicationFault=true; return -1; }
+    // Both shots were launched together by observe().
     unsigned long began=millis();
     while (true) {
         serviceMotionSensors();
@@ -547,8 +565,19 @@ int readSideForMotion(VL6180X &sensor) {
     return rangeStatus==0 ? mm : SIDE_NO_TARGET_MM;
 }
 
-bool observe(int &front,int &left,int &right) {
+bool observe(int &front,int &left,int &right,int &rightRaw) {
     sideCommunicationFault=false;
+    tofFrontRaw=tofLeftRaw=tofFrontFiltered=-1;
+    // Clear any unread result from a previously interrupted run, then start
+    // both side shots while the front sensor is also measuring.
+    leftTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
+    if (leftTof.last_status!=0) sideCommunicationFault=true;
+    rightTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
+    if (rightTof.last_status!=0) sideCommunicationFault=true;
+    leftTof.writeReg(VL6180X::SYSRANGE__START,0x01);
+    if (leftTof.last_status!=0) sideCommunicationFault=true;
+    rightTof.writeReg(VL6180X::SYSRANGE__START,0x01);
+    if (rightTof.last_status!=0) sideCommunicationFault=true;
     unsigned long began=millis();
     while (true) {
         serviceMotionSensors();
@@ -562,14 +591,22 @@ bool observe(int &front,int &left,int &right) {
     front=frontTof.read(false);
     bool frontValid=!frontTof.timeoutOccurred() && frontTof.last_status==0 &&
                     frontTof.ranging_data.range_status==VL53L1X::RangeValid;
+    tofFrontRaw=front;
+    tofFrontFiltered=frontFilter.update(front,frontValid);
     // Brake before side reads or logging when the front sample requires a stop.
     if (!frontValid || front <= FRONT_EMERGENCY_STOP_MM) {
         drive(0, 0);
-        left=right=-1;
+        left=right=rightRaw=-1;
         return frontValid;
     }
-    left=readSideForMotion(leftTof);
-    right=sideClearanceMm(readSideForMotion(rightTof), RIGHT_TOF_INSET_MM);
+    tofLeftRaw=readSideForMotion(leftTof);
+    // A newly distant reading must release the wall immediately, even if the
+    // median still contains two old close readings. Distances are chassis-based.
+    left=leftFilter.update(tofLeftRaw,tofLeftRaw>=0 &&
+        tofLeftRaw<WallModeDetector::RETAIN_MM);
+    rightRaw=readSideForMotion(rightTof);
+    right=sideClearanceMm(rightFilter.update(rightRaw,
+        rightRaw>=0 && sideClearanceMm(rightRaw,RIGHT_TOF_INSET_MM)<WallModeDetector::RETAIN_MM), RIGHT_TOF_INSET_MM);
     serviceMotionSensors();
     return frontValid;
 }
@@ -577,6 +614,21 @@ bool observe(int &front,int &left,int &right) {
 // ============================================================
 // Movement
 // ============================================================
+
+void reportMovementConfig() {
+    debugPrintln("Forward build: physical-motor-map-v3 | compiled " __DATE__ " " __TIME__);
+    debugPrintln("Physical LEFT: motor 27/14, encoder 33 | RIGHT: motor 25/26, encoder 35");
+    char config[480];
+    snprintf(config,sizeof(config),
+        "CONFIG | wall acquire/retain/confirm: %d/%d/%d | cruise: %d | factors L/R: %.3f/%.3f | MPU sign: %.0f | no-wall base/motor floor: %d/%d | encoder PID: %.2f/%.2f/%.2f | one-wall PID: %.2f/%.2f/%.2f | two-wall PID: %.2f/%.2f/%.2f",
+        WallModeDetector::ACQUIRE_MM,WallModeDetector::RETAIN_MM,WallModeDetector::CONFIRM_SAMPLES,
+        FORWARD_SPEED,LEFT_FACTOR,RIGHT_FACTOR,MPU_YAW_SIGN,
+        NO_WALL_MIN_BASE_PWM,NO_WALL_MIN_MOTOR_PWM,
+        NO_WALL_ENCODER_KP,NO_WALL_ENCODER_KI,NO_WALL_ENCODER_KD,
+        SINGLE_WALL_KP,SINGLE_WALL_KI,SINGLE_WALL_KD,
+        TWO_WALL_KP,TWO_WALL_KI,TWO_WALL_KD);
+    debugPrintln(config);
+}
 
 bool runForwardDistance() {
     if (!sensorsReady) {
@@ -625,8 +677,8 @@ bool runForwardDistance() {
             break;
         }
 
-        int front = -1, sideLeft = -1, sideRight = -1;
-        bool frontValid = observe(front, sideLeft, sideRight);
+        int front = -1, sideLeft = -1, sideRight = -1, sideRightRaw = -1;
+        bool frontValid = observe(front, sideLeft, sideRight, sideRightRaw);
         // Stop wins over a sensor fault received during a blocking read.
         handleWiFiClient();
         if (motionStopRequested || readCommand() == MovementCommand::Stop) {
@@ -689,6 +741,7 @@ bool runForwardDistance() {
         } else {
             twoWallPid.reset();
             singleWallPid.reset();
+            approachSpeed=noWallApproachSpeed(approachSpeed,NO_WALL_MIN_BASE_PWM,FORWARD_SPEED);
             commands=noWallPid.update(left,right,approachSpeed,
                 NO_WALL_SETTINGS,dt,encoderError,encoderPwm);
         }
@@ -696,16 +749,19 @@ bool runForwardDistance() {
 
         if (millis() - lastLog >= 200) {
             // One complete line reduces the number of WiFi write calls.
-            char telemetry[420];
+            char telemetry[560];
             snprintf(telemetry, sizeof(telemetry),
-                "ticks L/R: %lu/%lu | mm F/L/R (R corrected): %d/%d/%d | command L/R: %d/%d | remaining ticks: %lu | distance PID PWM: %d | case: %s | yaw: %.2f | wall error: %.1f | wall PID PWM: %.2f | encoder error/PWM: %.1f/%.2f | MPU trim: %.2f",
-                left, right, front, sideLeft, sideRight, commands.left, commands.right, remaining, approachSpeed,
+                "ticks L/R: %lu/%lu | ToF mm F/Lfiltered/Rraw/Rfiltered-corrected: %d/%d/%d/%d | command L/R: %d/%d | remaining ticks: %lu | distance PID PWM: %d | case: %s | yaw: %.2f | wall error: %.1f | wall PID PWM: %.2f | encoder error/PWM: %.1f/%.2f | MPU trim: %.2f | Ffiltered/Lraw: %d/%d | dt ms: %.1f | side walls detected: %d",
+                left, right, front, sideLeft, sideRightRaw, sideRight,
+                commands.left, commands.right, remaining, approachSpeed,
                 mode==WallMode::Two?"two":(mode==WallMode::LeftOnly?"left+MPU":(mode==WallMode::RightOnly?"right+MPU":"none:encoder")),
-                yawRight,wallError,wallPwm,encoderError,encoderPwm,mpuPwm);
+                yawRight,wallError,wallPwm,encoderError,encoderPwm,mpuPwm,
+                tofFrontFiltered,tofLeftRaw,dt*1000.0f,
+                mode==WallMode::Two?2:(mode==WallMode::None?0:1));
             debugPrintln(telemetry);
             lastLog = millis();
         }
-        waitWithMotionService(10); // Maintain the tested MPU sampling cadence.
+        waitWithMotionService(5); // MPU is also serviced during sensor waits.
     }
 
     drive(0, 0); // Always brake both wheels together.
@@ -733,12 +789,14 @@ bool runForwardDistance() {
 }
 
 void runMove() {
+    reportMovementConfig();
+    frontFilter.reset(); leftFilter.reset(); rightFilter.reset();
     motionStopRequested=false;
     mpuYaw.reset();
     wallDetector.reset();
     debugPrintln("Moving 7 cells continuously (1260 mm); front brake at 40 mm.");
     if (!runForwardDistance()) {
-        debugPrintln("Run stopped; send start when ready for a new run.");
+        debugPrintln("Run stopped; send s when ready for a new run.");
         return;
     }
     debugPrintln("All 7 cells completed. Robot remains stopped.");
@@ -850,7 +908,7 @@ void setup() {
 
 
     debugPrint(
-        "Forward run on start command: "
+        "Forward run on s command: "
     );
 
     debugPrint(
@@ -904,7 +962,7 @@ void setup() {
 
 
     debugPrintln(
-        "Ready. Send start for 7 continuous cells; d cancels the run."
+        "Ready. Send s for 7 continuous cells; d cancels the run."
     );
 
 
@@ -918,7 +976,7 @@ void setup() {
 
 void loop() {
 
-    // One start runs seven cells with automatic half-second stops between cells.
+    // One s command runs seven cells continuously.
     handleWiFiClient();
     mpuYaw.service();
     MovementCommand command = readCommand();
@@ -926,14 +984,14 @@ void loop() {
         drive(0, 0);
 
         discardPendingCommands();
-        debugPrintln("Stopped. Send start for a fresh seven-cell run.");
+        debugPrintln("Stopped. Send s for a fresh seven-cell run.");
     } else if (command == MovementCommand::Start) {
         debugPrintln("Start received.");
         motionActive=true;
         runMove();
         motionActive=false;
         discardPendingCommands();
-        debugPrintln("Run ended. Staying stopped; send start for a new seven-cell run.");
+        debugPrintln("Run ended. Staying stopped; send s for a new seven-cell run.");
     }
 
     delay(10);

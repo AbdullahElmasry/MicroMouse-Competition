@@ -9,8 +9,8 @@ int main() {
   assert(sideClearanceMm(5, 10) == 0);
   assert(sideClearanceMm(-1, 10) == -1);
   const ForwardWallSettings correctedSettings = {70, 30, 40, 40};
-  assert(forwardWallCommands(40, sideClearanceMm(50, 10), correctedSettings).right == 70);
-  assert(forwardWallCommands(40, sideClearanceMm(49, 10), correctedSettings).right == 30);
+  assert(forwardWallCommands(40, sideClearanceMm(50, 10), correctedSettings).left == 70);
+  assert(forwardWallCommands(40, sideClearanceMm(49, 10), correctedSettings).left == 30);
   const ForwardWallSettings settings = {70, 30, 40, 50};
   struct Example { int leftMm, rightMm, leftCommand, rightCommand; };
   const Example examples[] = {
@@ -28,8 +28,8 @@ int main() {
   };
   for (const Example &example : examples) {
     const auto commands = forwardWallCommands(example.leftMm, example.rightMm, settings);
-    assert(commands.left == example.leftCommand);
-    assert(commands.right == example.rightCommand);
+    assert(commands.right == example.leftCommand);
+    assert(commands.left == example.rightCommand);
   }
   assert(!cellEncoderLimitReached(622, 618, 623, 619));
   assert(cellEncoderLimitReached(623, 580, 623, 619));

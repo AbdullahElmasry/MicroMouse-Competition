@@ -51,7 +51,7 @@ class TwoWallPidController {
       return commands;
     }
 
-    // Positive means the left wall is closer, so slow the left motor.
+    // Positive means the left wall is closer, so slow the physical right motor.
     errorMm = (float)rightMm - (float)leftMm;
     if (fabsf(errorMm) <= settings.toleranceMm) {
       errorMm = 0.0f;
@@ -90,9 +90,9 @@ class TwoWallPidController {
     havePrevious_ = true;
 
     if (correctionPwm > 0.0f) {
-      commands.left = (int)lroundf(baseSpeed - correctionPwm);
+      commands.right = (int)lroundf(baseSpeed - correctionPwm);
     } else {
-      commands.right = (int)lroundf(baseSpeed + correctionPwm);
+      commands.left = (int)lroundf(baseSpeed + correctionPwm);
     }
     return commands;
   }
@@ -103,15 +103,15 @@ class TwoWallPidController {
   bool havePrevious_ = false;
 };
 
-// Preserve main.ino's physical motor convention and left-first priority.
+// Physical wheel convention: turn away from the close wall; left condition first.
 // Negative distances indicate invalid sensor readings, not a nearby wall.
 inline ForwardMotorCommands forwardWallCommands(
     int leftMm, int rightMm, const ForwardWallSettings &settings) {
   ForwardMotorCommands commands = {settings.baseSpeed, settings.baseSpeed};
   if (leftMm >= 0 && leftMm < settings.leftThresholdMm) {
-    commands.left = settings.slowSpeed;
-  } else if (rightMm >= 0 && rightMm < settings.rightThresholdMm) {
     commands.right = settings.slowSpeed;
+  } else if (rightMm >= 0 && rightMm < settings.rightThresholdMm) {
+    commands.left = settings.slowSpeed;
   }
   return commands;
 }

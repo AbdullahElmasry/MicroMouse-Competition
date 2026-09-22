@@ -22,13 +22,14 @@ class MovementCommands {
 
   MovementCommand poll(uint32_t nowMs) {
     // Also accept a terminal configured to send without a line ending.
-    if ((length_ == 5 || invalid_) && uint32_t(nowMs - lastByteMs_) >= 100) return finish();
+    if ((length_ == 1 || length_ == 5 || invalid_) && uint32_t(nowMs - lastByteMs_) >= 100) return finish();
     return MovementCommand::None;
   }
 
  private:
   MovementCommand finish() {
-    bool start = !invalid_ && length_ == 5 && memcmp(buffer_, "start", 5) == 0;
+    bool start = !invalid_ && ((length_ == 1 && buffer_[0] == 's') ||
+                              (length_ == 5 && memcmp(buffer_, "start", 5) == 0));
     reset();
     return start ? MovementCommand::Start : MovementCommand::None;
   }

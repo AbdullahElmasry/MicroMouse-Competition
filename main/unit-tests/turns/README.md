@@ -1,38 +1,31 @@
-# 90-degree left/right turn test
+# 90-degree left/right rotation test
 
-Open `turns.ino`, upload it, and keep the robot completely still while the MPU calibrates. Use USB Serial at 115200 baud:
+Open `turns.ino`, upload it, and keep the robot completely still during the 200-sample gyro calibration. No movement starts automatically.
 
-- `l`: simultaneous-wheel left 90-degree turn.
-- `r`: simultaneous-wheel right 90-degree turn.
-- `d` or `x`: brake and abort the active turn.
+Use USB Serial at 115200 baud, or connect to the printed ESP32 IP address on TCP port 23 using the existing Wi-Fi credentials:
 
-No turn starts automatically. Both wheels move throughout the turn in opposite directions. For a right turn, the left wheel moves forward while the right wheel reverses. A left turn mirrors those commands. MPU yaw ends the movement at the 90-degree target.
+- `l` / `L`: left 90 degrees.
+- `r` / `R`: right 90 degrees.
+- `d` / `D` / `x` / `X`: stop, including during a turn.
 
-Both motors receive the same fixed raw PWM magnitude of 60 until the predicted braking point. Turn-specific motor factors are both 1.0, so neither side is reduced by the forward movement multipliers. The commands always have equal magnitude and opposite direction; encoder readings are diagnostic and never alter either motor command. PWM was reduced from 80 after hardware logs showed high yaw rates, 10-18 degrees of momentum, and large inconsistent wheel-count differences caused by slip.
+Other commands received during a turn are discarded, as before.
 
-This rotates around the wheel-axle center. Because that point is 43 mm behind the chassis center, the chassis center still follows an arc during rotation. Test with the wheels raised first to verify both directions, then test on the maze surface with clearance around the swept body.
+`turns.ino` handles Wi-Fi, USB commands, and logging. `rotation.h` and `rotation.cpp` contain the motor driving, raw MPU reads, calibration, and relative-angle PID rotation. They replace the old fixed-PWM/predictive-braking helpers and the dependency on `moving_forward/MpuYaw.h`.
 
-## Control and safety
+The rotation follows the supplied working code:
 
-The tested Kalman-filtered MPU yaw supplies the stop threshold. `MPU_YAW_SIGN = -1` matches the verified mounting: physical right turns normalize positive and physical left turns normalize negative. The right target is +90 degrees and the left target is -90 degrees.
+- Left motor IN1/IN2: GPIO 25/26; right motor IN1/IN2: GPIO 14/27; enable: GPIO 23.
+- I2C SDA/SCL: GPIO 21/22; MPU address: `0x68`.
+- MPU6050 gyro range: +/-500 degrees/second, scale 65.5, with negated Z rate so right turns are positive.
+- Startup calibration averages 200 stationary Z-rate samples. A 0.5-degree/second deadband prevents stationary noise from accumulating, with no software Kalman filter.
+- The MPU6050 hardware gyro filter uses `DLPF_CFG=6` (5 Hz).
+- PID gains: Kp = 5.62, Ki = 0, Kd = 0, with integral anti-windup.
+- PWM floor: 85; cap: 150; equal and opposite wheel commands. The floor keeps enough torque to overcome drivetrain stiction during the final correction.
+- Update interval: at least 5 ms; tolerance: 1.5 degrees for 10 consecutive stopped samples; timeout: 2000 ms.
+- Stops set both input pins to zero, matching the supplied code.
 
-- Completion tolerance = +/-1.5 degrees.
-- Fixed raw PWM magnitude = 60.
-- Turn motor factors = 1.0 left and 1.0 right.
-- Predictive brake lead = 4 degrees + 0.050 seconds of current directional yaw rate.
+Tune the constants near the top of `rotation.cpp`. Heading is integrated during each turn, and each requested angle is relative to its starting heading. The supplied loop's motor output within the tolerance band is preserved. Encoder stall checks and predictive braking are no longer used.
 
-The predictive lead comes from hardware logs where braking at 89-90 degrees still produced another 10-18 degrees of rotation. For example, at 160 degrees/second the projected lead is 12 degrees, so braking begins around 78 degrees and the active brake absorbs the remaining motion. Telemetry prints `projected stop` for direct tuning against the final yaw.
+Wi-Fi/USB stop commands are checked throughout the loop. Failed MPU initialization refuses turns; a failed gyro read stops the motors and requires reinitialization/reset before further turns.
 
-Both encoders remain active for stall detection and diagnostics. They do not decide the final angle. Either wheel reaching 900 ticks stops the turn as a safety fault. Either wheel having no encoder progress for 1000 ms, an unhealthy MPU, or a five-second timeout also brakes both motors.
-
-Telemetry reports both encoder counts, normalized yaw, yaw rate, projected stopping angle, and the equal-magnitude signed motor commands. At completion it reports yaw when braking started and yaw after 150 ms of braking, which shows whether the prediction matched the actual momentum.
-
-## Hardware tuning
-
-Run at least five left and five right turns and measure the physical result with the same chassis reference line. Record final yaw, physical angle, left/right counts, and center displacement. Adjust one setting at a time:
-
-- Consistent overshoot in both directions: increase `TURN_BASE_BRAKE_LEAD_DEGREES` or `TURN_BRAKE_LOOKAHEAD_SECONDS`.
-- Consistent undershoot: reduce the base lead or lookahead.
-- One direction differs from the other: compare encoder counts and inspect reverse-direction motor behavior before changing the shared PWM.
-
-The first acceptance target is physical angle error within 3 degrees and center displacement within 5 mm in both directions. MPU yaw is feedback, not an independent physical measurement.
+Run the host checks with `powershell -ExecutionPolicy Bypass -File unit-tests/turns/tests/run_tests.ps1` (requires `g++`). These exercise the actual rotation and command code with simulated Arduino/Wi-Fi/I2C hardware. An ESP32 build and physical left/right turn checks are still needed to verify hardware behavior.

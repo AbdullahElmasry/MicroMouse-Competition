@@ -5,15 +5,32 @@
 
 int main() {
   WallModeDetector detector;
+  assert(detector.update(45,55)==WallMode::None);
+  assert(detector.update(45,55)==WallMode::None);
   assert(detector.update(45,55)==WallMode::Two);
-  assert(detector.update(45,130)==WallMode::Two); // Hysteresis retains detected wall.
-  assert(detector.update(45,140)==WallMode::LeftOnly);
+  assert(detector.update(45,90)==WallMode::Two); // Retention hysteresis.
+  assert(detector.update(45,100)==WallMode::LeftOnly);
   assert(detector.update(45,130)==WallMode::LeftOnly);
-  assert(detector.update(45,110)==WallMode::Two);
+  assert(detector.update(45,55)==WallMode::LeftOnly);
+  assert(detector.update(45,55)==WallMode::LeftOnly);
+  assert(detector.update(45,55)==WallMode::Two);
   assert(detector.update(-1,45)==WallMode::RightOnly);
   assert(detector.update(-1,200)==WallMode::None);
   detector.reset();
   assert(detector.update(125,125)==WallMode::None);
+  // Replay the open-space run: these distant right readings must not steer.
+  const int openReadings[] = {190,87,134,190,190};
+  for (int right : openReadings)
+    assert(detector.update(200,right)==WallMode::None);
+  assert(detector.update(200,50)==WallMode::None); // Single close spike.
+  assert(detector.update(200,190)==WallMode::None);
+  // New uploaded log reported right+MPU at 134 and two walls at 129/38.
+  // Neither is possible with the current retention threshold, even when acquired.
+  detector.reset();
+  for (int i=0;i<3;++i) detector.update(40,40);
+  assert(detector.update(200,134)==WallMode::None);
+  for (int i=0;i<3;++i) detector.update(40,40);
+  assert(detector.update(129,38)==WallMode::RightOnly);
   const SingleWallSettings settings={40,50,3.6f,30,1,0.10f,5,1.5f,0.05f,0.08f,40};
   SingleWallController pid;
   float error,wall,mpu;
@@ -22,25 +39,25 @@ int main() {
     return pid.update(mode,left,right,yaw,rate,base,settings,0.05f,error,wall,mpu);
   };
   auto commands=evaluate(WallMode::LeftOnly,40,200,0,0,70);
-  assert(commands.left==70 && commands.right==70 && wall==0);
+  assert(commands.right==70 && commands.left==70 && wall==0);
   commands=evaluate(WallMode::LeftOnly,25,200,0,0,70);
-  assert(commands.left>30 && commands.left<70 && commands.right==70 && error==15 && wall>0);
+  assert(commands.right>30 && commands.right<70 && commands.left==70 && error==15 && wall>0);
   commands=evaluate(WallMode::RightOnly,200,25,0,0,70);
-  assert(commands.right>=30 && commands.right<70 && commands.left==70 && error== -25);
+  assert(commands.left>=30 && commands.left<70 && commands.right==70 && error== -25);
   commands=evaluate(WallMode::LeftOnly,55,200,0,0,70);
-  assert(commands.right<70 && commands.left==70);
-  commands=evaluate(WallMode::RightOnly,200,55,0,0,70);
   assert(commands.left<70 && commands.right==70);
+  commands=evaluate(WallMode::RightOnly,200,55,0,0,70);
+  assert(commands.right<70 && commands.left==70);
   commands=evaluate(WallMode::RightOnly,200,65,45,100,70);
-  assert(commands.left<70 && commands.right==70 && mpu==0); // MPU cannot reverse wall PID.
+  assert(commands.right<70 && commands.left==70 && mpu==0); // MPU cannot reverse wall PID.
   commands=evaluate(WallMode::RightOnly,200,53,0,0,70);
-  assert(commands.left==70 && commands.right==70 && wall==0);
+  assert(commands.right==70 && commands.left==70 && wall==0);
   commands=evaluate(WallMode::LeftOnly,40,200,5,0,70);
-  assert(commands.right==65 && commands.left==70 && mpu== -5);
+  assert(commands.left==65 && commands.right==70 && mpu== -5);
   commands=evaluate(WallMode::LeftOnly,40,200,0,10,70);
-  assert(commands.right<commands.left);
+  assert(commands.left<commands.right);
   commands=evaluate(WallMode::LeftOnly,1,200,-20,0,35);
-  assert(commands.left==30 && commands.right==35 && wall==5);
+  assert(commands.right==30 && commands.left==35 && wall==5);
   // Sustained saturation must not accumulate a large integral.
   for(int i=0;i<1000;++i) pid.update(WallMode::LeftOnly,1,200,0,0,35,settings,0.05f,error,wall,mpu);
   pid.update(WallMode::LeftOnly,35,200,0,0,70,settings,0.05f,error,wall,mpu);
@@ -61,9 +78,10 @@ int main() {
   pid.update(WallMode::RightOnly,200,60,0,0,70,settings,0.05f,error,wall,mpu);
   assert(fabsf(wall-initial)<0.0001f); // Deadband resets PID too.
   commands=pid.update(WallMode::RightOnly,200,60,0,0,70,settings,0,error,wall,mpu);
-  assert(commands.left==0 && commands.right==0);
+  assert(commands.right==0 && commands.left==0);
+
   auto old=forwardWallCommands(32,68,{70,30,40,50});
-  assert(old.left==30 && old.right==70); // Case 1 unchanged.
+  assert(old.right==30 && old.left==70); // Case 1 unchanged.
 
   YawEstimate yaw;
   yaw.reset(0);

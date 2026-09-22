@@ -22,7 +22,7 @@ The left condition takes priority if both thresholds trigger. These are pre-bala
 
 Tune `FORWARD_SPEED`, `WALL_SLOW_SPEED`, `LEFT_WALL_THRESHOLD_MM`, `RIGHT_WALL_THRESHOLD_MM`, `LEFT_FACTOR`, and `RIGHT_FACTOR` in the sketch. `ForwardWallControl.h` contains the steering decision and encoder stopping rule. The old `WallCentering.h` and its tests remain available for reference but are not included by this sketch. The last manually tuned PID values observed before this change were Kp=0.2, Ki=0, Kd=0, correction limit=40; those old lateral PID gains are not active.
 
-Each run uses one encoder baseline and total limits of 4359 left / 4335 right ticks, derived from the two seven-cell hand-pushed measurements. Both wheels brake when either limit is reached, just like main.ino's OR condition. This intentionally differs from requiring both wheel targets. It can shorten travel if wheel progress differs, so measure total distance instead of assuming 180 mm or 1260 mm is exact.
+Each run uses one encoder baseline and total limits of 4314 left / 4322 right ticks, derived from the two seven-cell hand-pushed measurements. Both wheels brake when either limit is reached, just like main.ino's OR condition. This intentionally differs from requiring both wheel targets. It can shorten travel if wheel progress differs, so measure total distance instead of assuming 180 mm or 1260 mm is exact.
 
 ## Reducing endpoint overshoot
 
@@ -33,7 +33,7 @@ Edit `APPROACH_SETTINGS` in the sketch:
 - Kp = 0.24 PWM/tick; Ki = 0.01 PWM/(tick*second); Kd = 0.01 PWM*second/tick. These are initial, unverified physical tuning values.
 - `APPROACH_SLOWDOWN_TICKS = 300`. A larger zone permits earlier deceleration, but speed is also determined by the PID output.
 - `MIN_APPROACH_PWM = 35`. Lower cautiously if the robot still overshoots; both motors must remain able to roll under load.
-- `BRAKE_LEAD_TICKS = 10`, requesting braking approximately 2.9 mm before the nominal seven-cell endpoint. Effective thresholds are 4349 left / 4325 right ticks. Increase gradually; this changes the braking point, not the distance calibration.
+- `BRAKE_LEAD_TICKS = 10`, requesting braking approximately 2.9 mm before the nominal seven-cell endpoint. Effective thresholds are 4304 left / 4312 right ticks. Increase gradually; this changes the braking point, not the distance calibration.
 
 Keep integral small: this is an endpoint approach, not a speed regulator. PID state resets at each run, output is bounded, and integral accumulation is suppressed at the limits. Encoder crossing triggers joint braking regardless of PID state.
 
@@ -89,12 +89,12 @@ Test a left-only corridor and then a right-only corridor. Telemetry labels case 
 
 When neither side wall is detected, `NoWallControl.h` holds the direction using calibrated encoder progress only. Entering case 3 captures the current left/right counts, so corrections made before the open area do not create an immediate encoder error. If either wall returns, the controller resets and the movement loop switches to case 1 or case 2 on that sample. Case 3 does not require a healthy MPU or use yaw in its steering command.
 
-Positive encoder correction slows the named right motor; negative correction slows the named left motor. This direction comes from hardware case-3 logs: reducing the left command while the encoder error was positive increased the right drift and drove the PID into saturation. The active case-3 PID is:
+Positive encoder correction slows the left motor; negative correction slows the right motor. The user verified that each physical motor and encoder has the same left/right label, so the wheel ahead in calibrated travel must be slowed. The active case-3 PID is:
 
-- Encoder PID: Kp = 1.0, Ki = 0.10, Kd = 0.0.
+- Encoder PID: Kp = 1.7, Ki = 0.10, Kd = 0.0.
 - Encoder PID output limit = 40 PWM.
 
-Encoder error compares distance progress using the two manual seven-cell trials: 4373/4344 and 4345/4325 ticks. Their averages are 4359 left and 4334.5 right over 1260 mm, or about 622.7/619.2 ticks per cell. Comparing normalized progress means this expected count difference represents equal travel rather than steering error. Telemetry labels this mode `none:encoder` and prints encoder error/PWM. On this robot, extra left-encoder progress reduces the named right command, and extra right-encoder progress reduces the named left command. Ki corrects persistent residual imbalance; conditional integration prevents windup while the output is limited.
+Encoder error compares distance progress using the two manual seven-cell trials: 4363/4360 and 4265/4283 ticks. Their averages are 4314 left and 4321.5 right over 1260 mm, or about 616.286/617.357 ticks per cell. Comparing normalized progress means this expected count difference represents equal travel rather than steering error. Telemetry labels this mode `none:encoder` and prints encoder error/PWM. On this robot, extra left-encoder progress reduces the left command, and extra right-encoder progress reduces the right command. Ki corrects persistent residual imbalance; conditional integration prevents windup while the output is limited.
 
 ## Verification
 
