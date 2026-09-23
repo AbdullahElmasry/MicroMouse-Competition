@@ -46,7 +46,7 @@ void initSensorsLikeMain() {
   digitalWrite(RIGHT_XSHUT, LOW);
   digitalWrite(FRONT_XSHUT, LOW);
   delay(10);
-
+  
   digitalWrite(LEFT_XSHUT, HIGH);
   delay(50);
   leftTof.init(); // VL6180X::init() returns void.

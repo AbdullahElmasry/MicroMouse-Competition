@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_system.h>
 
 #include "DemoMotion.h"
 #include "MazeMap.h"
@@ -10,6 +11,7 @@
 MazeMap maze;
 bool rotationReady = false;
 bool explorerRunning = false;
+bool poseUncertain = false;
 unsigned long completedCells = 0;
 int robotX = 0;
 int robotY = 0;
@@ -55,6 +57,7 @@ void stopExplorer(const char *reason) {
 
 void resetMap() {
   maze.reset();
+  poseUncertain = false;
   robotX = 0;
   robotY = 0;
   robotHeading = Direction::North;
@@ -72,7 +75,7 @@ bool readOpenPaths(bool &frontOpen, bool &leftOpen, bool &rightOpen,
     if (stopRequested()) return false;
     int front, left, right;
     if (!demoReadPaths(front, left, right)) return false;
-    frontOpen = frontOpen && front > FRONT_OPEN_MM;
+    frontOpen = frontOpen && front > FRONT_MAP_OPEN_MM;
     leftOpen = leftOpen && left > SIDE_OPEN_MM;
     rightOpen = rightOpen && right > SIDE_OPEN_MM;
     if (front < frontMm) frontMm = front;
@@ -100,14 +103,15 @@ void updateMapFromScan(bool frontOpen, bool leftOpen, bool rightOpen) {
            !frontOpen, !leftOpen, !rightOpen, conflicts);
   demoLog(line);
   if (conflicts) {
-    demoLog("MAP WARNING | sensor result changed a previously known wall");
+    demoLog("MAP WARNING | scan disagrees with known edge; traversed openings stay open");
   }
   publishState("Mapping");
 }
 
 bool turnAndSettle(float degrees) {
   if (stopRequested() || !turnDegrees(degrees)) return false;
-  return settle();
+  if (!settle()) return false;
+  return demoResetYaw();
 }
 
 bool turnTo(Direction target) {
@@ -169,6 +173,20 @@ void runFloodStep() {
         : "FAULT | scan failed after retries; see SCAN ERROR");
     return;
   }
+  // A single borderline scan must not seal the only exit from the start.
+  if (completedCells == 0 && !frontOpen && !leftOpen && !rightOpen) {
+    for (int retry = 0; retry < 2; ++retry) {
+      demoLog("SCAN RETRY | no exit from start; checking again");
+      if (!settle() || !readOpenPaths(frontOpen, leftOpen, rightOpen,
+                                      frontMm, leftMm, rightMm)) {
+        stopExplorer(demoStopped()
+            ? "STOP | scan cancelled"
+            : "FAULT | start scan failed after retries");
+        return;
+      }
+      if (frontOpen || leftOpen || rightOpen) break;
+    }
+  }
   updateMapFromScan(frontOpen, leftOpen, rightOpen);
   logPose("SCANNED");
 
@@ -193,6 +211,7 @@ void runFloodStep() {
   demoLog(line);
 
   if (!turnTo(selected)) {
+    poseUncertain = true;
     stopExplorer("FAULT | navigation turn stopped or failed");
     return;
   }
@@ -216,40 +235,71 @@ void runFloodStep() {
     stopExplorer("STOP | command received before movement");
     return;
   }
-  snprintf(line, sizeof(line), "MOVE PLAN | (%d,%d) -> (%d,%d) heading=%s",
-           robotX, robotY, nextX, nextY,
-           MazeMap::directionName(robotHeading));
+  const int cellsToMove = maze.knownStraightRunLength(
+      robotX, robotY, robotHeading, 3);
+  if (cellsToMove < 1) {
+    stopExplorer("FAULT | selected edge is not traversable in the map");
+    return;
+  }
+  const int destinationX = robotX + cellsToMove * MazeMap::dx(robotHeading);
+  const int destinationY = robotY + cellsToMove * MazeMap::dy(robotHeading);
+  snprintf(line, sizeof(line), "MOVE PLAN | (%d,%d) -> (%d,%d) heading=%s | cells=%d%s",
+           robotX, robotY, destinationX, destinationY,
+           MazeMap::directionName(robotHeading), cellsToMove,
+           cellsToMove > 1 ? " continuous" : "");
   demoLog(line);
-  const DemoMoveResult outcome = demoMoveOneCell();
+  const DemoMoveResult outcome = demoMoveStraightCells(cellsToMove);
   if (outcome == DemoMoveResult::Stopped ||
       outcome == DemoMoveResult::Failed) {
+    poseUncertain = true;
     stopExplorer(outcome == DemoMoveResult::Stopped
-        ? "STOP | cell movement cancelled"
-        : "FAULT | cell movement failed; coordinates unchanged");
+        ? "STOP | cell movement cancelled; pose uncertain; return to start and reset map"
+        : "FAULT | cell movement failed; pose uncertain; return to start and reset map");
     return;
   }
   demoLog(outcome == DemoMoveResult::FrontWallReached
-      ? "ARRIVAL | front-wall reference reached"
+      ? "ARRIVAL | front-wall brake; checking settled distance after alignment"
       : "ARRIVAL | encoder target reached");
   if (!alignArrivalHeading()) {
+    poseUncertain = true;
     stopExplorer("FAULT | arrival heading correction failed");
     return;
   }
 
-  const int oldX = robotX;
-  const int oldY = robotY;
-  robotX += MazeMap::dx(robotHeading);
-  robotY += MazeMap::dy(robotHeading);
-  if (!maze.inBounds(robotX, robotY)) {
-    robotX = oldX;
-    robotY = oldY;
-    stopExplorer("FAULT | move would place pose outside maze");
+  const DemoMoveResult reference = demoReachFrontWallReference();
+  if (reference == DemoMoveResult::Stopped ||
+      reference == DemoMoveResult::Failed) {
+    poseUncertain = true;
+    stopExplorer(reference == DemoMoveResult::Stopped
+        ? "STOP | front-wall adjustment cancelled; pose uncertain"
+        : "FAULT | front-wall adjustment failed; pose uncertain");
     return;
   }
-  maze.markTraversed(oldX, oldY, robotHeading);
+  if (reference == DemoMoveResult::FrontWallReached &&
+      !alignArrivalHeading()) {
+    poseUncertain = true;
+    stopExplorer("FAULT | heading correction after front-wall adjustment failed");
+    return;
+  }
+
+  for (int cell = 0; cell < cellsToMove; ++cell) {
+    const int oldX = robotX;
+    const int oldY = robotY;
+    robotX += MazeMap::dx(robotHeading);
+    robotY += MazeMap::dy(robotHeading);
+    if (!maze.inBounds(robotX, robotY)) {
+      robotX = oldX;
+      robotY = oldY;
+      poseUncertain = true;
+      stopExplorer("FAULT | move would place pose outside maze");
+      return;
+    }
+    maze.markTraversed(oldX, oldY, robotHeading);
+    ++completedCells;
+    logPose("CELL REACHED");
+  }
   maze.floodFill();
-  ++completedCells;
-  logPose("CELL REACHED");
+  if (cellsToMove > 1) logPose("CONTINUOUS RUN COMPLETE");
   publishState(maze.isGoal(robotX, robotY)
       ? "Center reached; final scan pending"
       : "Exploring");
@@ -257,6 +307,19 @@ void runFloodStep() {
 
 void setup() {
   Serial.begin(115200);
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const char *resetName = "other";
+  if (resetReason == ESP_RST_POWERON) resetName = "power-on";
+  else if (resetReason == ESP_RST_SW) resetName = "software";
+  else if (resetReason == ESP_RST_BROWNOUT) resetName = "brownout";
+  else if (resetReason == ESP_RST_PANIC) resetName = "panic";
+  else if (resetReason == ESP_RST_INT_WDT || resetReason == ESP_RST_TASK_WDT ||
+           resetReason == ESP_RST_WDT) resetName = "watchdog";
+  char bootLine[120];
+  snprintf(bootLine, sizeof(bootLine),
+           "BOOT | reset=%s (%d) | build=" __DATE__ " " __TIME__,
+           resetName, (int)resetReason);
+  demoLog(bootLine);
   rotationReady = beginRotation();
   moveForwardSetup();
   demoEndRun();
@@ -265,8 +328,9 @@ void setup() {
   dashboardBegin();
   resetMap();
 
-  demoLog("BUILD | flood-fill exploration-v1 | speed run disabled");
+  demoLog("BUILD | flood-fill exploration-v8 | encoder median | maze=16x16");
   demoLog("COMMANDS | s/start begins or resumes | d/stop stops | web reset clears map");
+  demoLog("MAP CONFIG | front open >120mm | sides open >100mm | front ToF brakes near walls");
   demoLog("COORDINATES | start=(0,0), north=+Y, east=+X");
   if (WiFi.status() == WL_CONNECTED) {
     char url[80];
@@ -295,6 +359,8 @@ void loop() {
     if (!rotationReady || !demoMotionReady()) {
       demoLog("REFUSED | rotation, MPU or ToF unavailable; reset ESP32");
       publishState("Initialization fault");
+    } else if (poseUncertain) {
+      demoLog("REFUSED | pose uncertain after interrupted motion; return robot to start and reset map");
     } else if (maze.isGoal(robotX, robotY)) {
       demoLog("REFUSED | goal already reached; reset the map for another run");
     } else {

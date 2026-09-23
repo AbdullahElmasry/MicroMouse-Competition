@@ -64,6 +64,8 @@ bool MazeMap::setWall(int x, int y, Direction direction, bool present) {
   if (!inBounds(nx, ny)) present = true;
   MazeCell &here = cells_[y][x];
   const uint8_t mask = wallBit(direction);
+  // A completed physical crossing is stronger evidence than a later ToF scan.
+  if (present && (here.traversed & mask)) return true;
   const bool conflict = boundaryConflict ||
       ((here.known & mask) && (((here.walls & mask) != 0) != present));
   here.known |= mask;
@@ -92,7 +94,13 @@ int MazeMap::observe(int x, int y, Direction heading,
 }
 
 void MazeMap::markTraversed(int x, int y, Direction direction) {
+  if (!inBounds(x, y)) return;
+  const int nx = x + dx(direction);
+  const int ny = y + dy(direction);
+  if (!inBounds(nx, ny)) return;
   setWall(x, y, direction, false);
+  cells_[y][x].traversed |= wallBit(direction);
+  cells_[ny][nx].traversed |= wallBit(opposite(direction));
 }
 
 bool MazeMap::canTravel(int x, int y, Direction direction) const {
@@ -156,6 +164,26 @@ bool MazeMap::chooseNext(int x, int y, Direction heading, Direction &next) const
     }
   }
   return found && bestDistance != FLOOD_UNREACHABLE;
+}
+
+int MazeMap::knownStraightRunLength(int x, int y, Direction direction,
+                                    int maximumCells) const {
+  if (maximumCells < 1 || !canTravel(x, y, direction)) return 0;
+  int cells = 1;
+  int nextX = x + dx(direction);
+  int nextY = y + dy(direction);
+  while (cells < maximumCells && inBounds(nextX, nextY) &&
+         cells_[nextY][nextX].visited &&
+         !isGoal(nextX, nextY) &&
+         (cells_[nextY][nextX].traversed & wallBit(direction))) {
+    Direction choice;
+    if (!chooseNext(nextX, nextY, direction, choice) || choice != direction)
+      break;
+    ++cells;
+    nextX += dx(direction);
+    nextY += dy(direction);
+  }
+  return cells;
 }
 
 const MazeCell &MazeMap::cell(int x, int y) const {
