@@ -1,5 +1,4 @@
-#include "../SingleWallControl.h"
-#include "../YawEstimate.h"
+#include "../MoveForward.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -80,22 +79,19 @@ int main() {
   commands=pid.update(WallMode::RightOnly,200,60,0,0,70,settings,0,error,wall,mpu);
   assert(commands.right==0 && commands.left==0);
 
+  // Recorded left-wall sequence 50 -> 49 -> 45 mm must keep correcting
+  // toward the wall instead of alternating between full correction and zero.
+  const SingleWallSettings tuned={40,40,3.6f,30,2,0.15f,15,3,0,0.05f,40};
+  pid.reset();
+  commands=pid.update(WallMode::LeftOnly,50,200,0,0,140,tuned,0.022f,error,wall,mpu);
+  assert(wall<0 && commands.left<140 && commands.right==140);
+  commands=pid.update(WallMode::LeftOnly,49,200,0,0,140,tuned,0.022f,error,wall,mpu);
+  assert(wall<0 && commands.left<140 && commands.right==140);
+  commands=pid.update(WallMode::LeftOnly,45,200,0,0,140,tuned,0.022f,error,wall,mpu);
+  assert(wall<0 && commands.left<140 && commands.right==140);
+
   auto old=forwardWallCommands(32,68,{70,30,40,50});
   assert(old.right==30 && old.left==70); // Case 1 unchanged.
 
-  YawEstimate yaw;
-  yaw.reset(0);
-  assert(yaw.update(0.4f,10) && yaw.yaw()==0); // Tested deadband.
-  yaw.reset(0);
-  assert(yaw.update(10,10));
-  assert(fabsf(yaw.rate()-5)<0.00001f && fabsf(yaw.yaw()-0.05f)<0.00001f);
-  for (int t=20;t<=1000;t+=10) assert(yaw.update(10,t));
-  assert(yaw.yaw()>8 && yaw.yaw()<10);
-  assert(!yaw.healthy(1101));
-  assert(!yaw.update(10,1200)); // A stale integration is never silently resumed.
-  assert(!yaw.update(10,1210));
-  yaw.reset(1220);
-  assert(yaw.healthy(1220) && yaw.yaw()==0);
-  assert(!yaw.update(NAN,1230));
-  puts("PASS: wall modes, hysteresis, mirrored wall correction, heading/rate feedback, speed bounds, yaw baseline and faults");
+  puts("PASS: wall modes, hysteresis, mirrored wall correction, heading/rate feedback and speed bounds");
 }

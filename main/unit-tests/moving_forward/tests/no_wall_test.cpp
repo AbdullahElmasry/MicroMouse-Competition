@@ -1,4 +1,4 @@
-#include "../NoWallControl.h"
+#include "../MoveForward.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -47,6 +47,18 @@ int main() {
   assert(noWallApproachSpeed(140,70,140)==140);
   assert(noWallApproachSpeed(35,70,50)==50);
   assert(noWallApproachSpeed(0,70,140)==0);
+  assert(noWallYawCorrection(5,0,2,0.15f,15)==-10);
+  assert(noWallYawCorrection(-20,0,2,0.15f,15)==15);
+  // Positive encoder PWM slows left; negative MPU trim also slows left.
+  commands=noWallCombinedCommands(140,60,10,-8,0.8f);
+  assert(commands.left==132 && commands.right==140);
+  // Opposing encoder and MPU corrections cancel into one steering command.
+  commands=noWallCombinedCommands(140,60,10,8,0.8f);
+  assert(commands.left==140 && commands.right==136);
+  commands=noWallCombinedCommands(70,60,-40,15,0.8f);
+  assert(commands.left==70 && commands.right==60); // Combined output respects floor.
+  commands=noWallCombinedCommands(140,60,10,15,0.0f);
+  assert(commands.left==130 && commands.right==140); // MPU failure restores 100% encoder.
   const NoWallSettings rolling={4314.0f/7.0f,4321.5f/7.0f,60,{1.7f,0.10f,0,40}};
   controller.reset();
   controller.update(0,0,70,rolling,0.046f,encoderError,encoderPwm);
@@ -67,5 +79,5 @@ int main() {
     }
     assert(fabsf(encoderError)<5.0f);
   }
-  puts("PASS: encoder-only case 3 calibration, Ki, anti-windup and rolling floors");
+  puts("PASS: case 3 encoder/MPU steering, fallback, limits and rolling floors");
 }

@@ -1,17 +1,12 @@
 $ErrorActionPreference = 'Stop'
 $sketchDirectory = Split-Path $PSScriptRoot -Parent
-$source = Get-Content -LiteralPath (Join-Path $sketchDirectory 'moving_forward.ino') -Raw
+$source = Get-Content -LiteralPath (Join-Path $sketchDirectory 'MoveForward.cpp') -Raw
 $begin = $source.IndexOf('bool runForwardDistance(')
-$end = $source.IndexOf('void setup()', $begin)
+$end = $source.IndexOf('void moveForwardSetup()', $begin)
 if ($begin -lt 0 -or $end -lt 0) { throw 'Movement functions not found' }
 $functions = $source.Substring($begin, $end - $begin)
 $harness = @'
-#include "ForwardWallControl.h"
-#include "CellApproachControl.h"
-#include "MovementCommands.h"
-#include "SingleWallControl.h"
-#include "NoWallControl.h"
-#include "TofFilter.h"
+#include "MoveForward.h"
 TofFilter frontFilter, leftFilter, rightFilter;
 int tofFrontFiltered=-1, tofLeftRaw=-1;
 #include <assert.h>
@@ -19,7 +14,9 @@ int tofFrontFiltered=-1, tofLeftRaw=-1;
 constexpr unsigned long LEFT_TARGET_TICKS=4314, RIGHT_TARGET_TICKS=4322;
 constexpr unsigned long MOVE_TIMEOUT_MS=105000, STALL_TIMEOUT_MS=1500;
 constexpr int FRONT_EMERGENCY_STOP_MM=40;
-constexpr int NO_WALL_MIN_BASE_PWM=70, FORWARD_SPEED=140;
+constexpr int NO_WALL_MIN_BASE_PWM=70, NO_WALL_MIN_MOTOR_PWM=60, FORWARD_SPEED=140;
+constexpr float NO_WALL_MPU_HEADING_KP=2.0f, NO_WALL_MPU_RATE_KD=1.5f,
+    NO_WALL_MPU_MAX_PWM=15.0f, NO_WALL_MPU_WEIGHT=0.80f;
 constexpr TwoWallPidSettings TWO_WALL_PID_SETTINGS={3.6f,30,1.4f,0,5.5f,40};
 constexpr CellApproachSettings APPROACH_SETTINGS={0.24f,0.01f,0.01f,300,70,35};
 constexpr unsigned long BRAKE_LEAD_TICKS=10;
@@ -48,10 +45,11 @@ void delay(unsigned long ms) {
   if (rightCommand) rightTicks += ms * rightCommand / 20;
 }
 template<class T> void debugPrint(const T&) {}
+template<class T> void debugPrint(const T&, int) {}
 template<class T> void debugPrintln(const T&) {}
 void debugPrintln() {}
 void reportMovementConfig() {}
-void handleWiFiClient() {}
+void handleBluetoothClient() {}
 void serviceMotionSensors() {}
 void waitWithMotionService(unsigned long ms) { delay(ms); }
 void readTicks(unsigned long &left, unsigned long &right) { left=leftTicks; right=rightTicks; }
@@ -102,7 +100,7 @@ int main() {
     else if (scenario==7) assert(starts==1 && stops==1);
     else assert(starts==1 && stops==1);
   }
-  puts("PASS: cases 1/2/3, transitions, encoder-only case 3, continuous seven cells, front brake, stop/fault cancellation");
+  puts("PASS: cases 1/2/3, transitions, case 3 MPU fallback, continuous seven cells, front brake, stop/fault cancellation");
 }
 '@
 $testDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('micromouse-sequence-' + [guid]::NewGuid().ToString('N'))

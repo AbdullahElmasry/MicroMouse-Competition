@@ -4,7 +4,21 @@ The right sensor is recessed 10 mm. The forward sketch subtracts RIGHT_TOF_INSET
 
 # Seven-cell forward test: two-wall and one-wall guidance
 
-Send `start` over WiFi TCP port 23 or USB Serial at 115200 baud. The robot moves seven 180 mm cells, continuously, with no intermediate cell stops. After cell seven it stays stopped. Send `d` during movement to cancel the remaining run. A new start begins a new seven-cell sequence, not the remainder of an interrupted run. No automatic startup movement occurs. Blocking sensor reads and WiFi writes can delay command handling.
+The forward implementation is packaged as `MoveForward.h` and `MoveForward.cpp`. The header contains the reusable controller types and the module entry points; the implementation owns the ESP32, motor, encoder, ToF, MPU6050, Bluetooth Serial, command, and telemetry details. `moving_forward.ino` is only a thin Arduino adapter that calls `moveForwardSetup()` and `moveForwardLoop()`. Copy those three files into another Arduino sketch folder to reuse the module; call `moveForwardStop()` when an external component must stop it.
+
+Send `start` over Bluetooth Serial or USB Serial at 115200 baud. The robot moves seven 180 mm cells, continuously, with no intermediate cell stops. After cell seven it stays stopped. Send `d` during movement to cancel the remaining run. A new start begins a new seven-cell sequence, not the remainder of an interrupted run. No automatic startup movement occurs. Blocking sensor reads and Bluetooth writes can delay command handling.
+
+## Bluetooth connection
+
+The ESP32 advertises a Bluetooth Classic Serial Port Profile device named `MicroMouse`.
+
+1. Upload the sketch and reset the ESP32.
+2. Check USB Serial for `Bluetooth Serial ready. Device name: MicroMouse`.
+3. On an Android phone or computer, pair with `MicroMouse` in Bluetooth settings.
+4. Open a Bluetooth serial terminal and connect to `MicroMouse`.
+5. Send `s` or `start` to begin the seven-cell run. Send `d` at any time to stop.
+
+The terminal should receive `ESP32 Micromouse connected by Bluetooth` followed by the same telemetry previously sent over Wi-Fi. Bluetooth Serial uses Classic SPP and requires an original ESP32 with Classic Bluetooth support; ESP32-S2, ESP32-C3, and ESP32-S3 targets cannot build this transport. Generic Bluetooth SPP terminal apps are commonly available on Android and desktop systems. USB Serial remains usable if Bluetooth initialization or connection fails.
 
 ## Why the controller changed
 
@@ -20,13 +34,13 @@ The earlier PID applied the opposite motor command change to the hardware-tested
 
 The left condition takes priority if both thresholds trigger. These are pre-balance commands: factors remain left 1.0 and right 0.78. The table describes cruise speed. During the approach, the distance PID reduces the base command from 70 toward 35; a wall correction still slows the same motor to 30. The movement loop delay is 10 ms, as in main.ino. Motor pins, polarity, and braking outputs are unchanged. Both thresholds now use 40 mm chassis clearance; lateral correction remains threshold-based. A separate encoder-distance PID controls forward approach speed.
 
-Tune `FORWARD_SPEED`, `WALL_SLOW_SPEED`, `LEFT_WALL_THRESHOLD_MM`, `RIGHT_WALL_THRESHOLD_MM`, `LEFT_FACTOR`, and `RIGHT_FACTOR` in the sketch. `ForwardWallControl.h` contains the steering decision and encoder stopping rule. The old `WallCentering.h` and its tests remain available for reference but are not included by this sketch. The last manually tuned PID values observed before this change were Kp=0.2, Ki=0, Kd=0, correction limit=40; those old lateral PID gains are not active.
+Tune `FORWARD_SPEED`, `WALL_SLOW_SPEED`, `LEFT_WALL_THRESHOLD_MM`, `RIGHT_WALL_THRESHOLD_MM`, `LEFT_FACTOR`, and `RIGHT_FACTOR` in `MoveForward.cpp`. `MoveForward.h` contains the reusable control types and encoder stopping rule. The last manually tuned PID values observed before this change were Kp=0.2, Ki=0, Kd=0, correction limit=40; those old lateral PID gains are not active.
 
 Each run uses one encoder baseline and total limits of 4314 left / 4322 right ticks, derived from the two seven-cell hand-pushed measurements. Both wheels brake when either limit is reached, just like main.ino's OR condition. This intentionally differs from requiring both wheel targets. It can shorten travel if wheel progress differs, so measure total distance instead of assuming 180 mm or 1260 mm is exact.
 
 ## Reducing endpoint overshoot
 
-`CellApproachControl.h` adds encoder-distance PID without reversing the working wall steering. It uses the smaller remaining count to either wheel's braking threshold, matching the rule that both motors stop at the first encoder limit. Outside the final 300 ticks (about 87 mm), the base PWM is 70. Inside that zone, PID reduces base PWM toward a floor of 35. The wall controller can still reduce the corresponding side to 30. All commands are before motor balance factors.
+The cell-approach controller in `MoveForward.h` adds encoder-distance PID without reversing the working wall steering. It uses the smaller remaining count to either wheel's braking threshold, matching the rule that both motors stop at the first encoder limit. Outside the final 300 ticks (about 87 mm), the base PWM is 70. Inside that zone, PID reduces base PWM toward a floor of 35. The wall controller can still reduce the corresponding side to 30. All commands are before motor balance factors.
 
 Edit `APPROACH_SETTINGS` in the sketch:
 
@@ -43,24 +57,24 @@ Each run reports counts at braking and counts added during the following 100 ms.
 
 ToF startup matches the working calibration/tof_readings sketch: Wire.begin(), 10 ms shutdown, left/right/front wake order with 50 ms delays, addresses 0x30/0x31/0x32, timeouts of 200 ms after address assignment, and front Medium mode with startContinuous(30). Status is reported after initialization rather than aborting at intermediate checks.
 
-A valid front ToF reading at or below `FRONT_EMERGENCY_STOP_MM = 40` brakes both motors immediately before side sensor reads. The run ends and requires a new `start`; clearing the obstacle does not resume it. This threshold is measured from the sensor face; actual stopping clearance depends on sampling and braking travel. Invalid front readings, both side readings invalid, encoder stall, whole-run timeout (105 seconds), or d cancel the run. A single invalid side is excluded from steering; the valid side can still request correction. If neither valid side is below its threshold, the robot uses 70/70. Invalid readings are shown as -1. The old side-distance-sum guard and 8 mm side stop are not used; case 2 has its own distance deadband and MPU freshness check. MPU feedback is used in one-wall mode only. Front-wall alignment is not implemented.
+A valid front ToF reading at or below `FRONT_EMERGENCY_STOP_MM = 40` brakes both motors immediately before side sensor reads. The run ends and requires a new `start`; clearing the obstacle does not resume it. This threshold is measured from the sensor face; actual stopping clearance depends on sampling and braking travel. Invalid front readings, both side readings invalid, encoder stall, whole-run timeout (105 seconds), or d cancel the run. A single invalid side is excluded from steering; the valid side can still request correction. Invalid readings are shown as -1. The old side-distance-sum guard and 8 mm side stop are not used. MPU feedback is used in one-wall and no-wall modes. Front-wall alignment is not implemented.
 
 ## Case 2: one usable side wall plus MPU yaw
 
 Case 1 keeps its tested main.ino threshold steering. Case 2 uses a dedicated wall-distance PID. Targets are 40 mm chassis clearance on both sides, with +/-3.6 mm tolerance; the right reading is corrected for its 10 mm inset first. Outside that band, positive signed error (left wall too close or right wall too far) slows the left motor; negative error slows the right. The amount is proportional/integral/derivative feedback rather than a fixed drop straight to 30 PWM. MPU trim remains secondary: it operates only inside the distance band and cannot override a distance correction.
 
-Tune these named constants in moving_forward.ino:
+Tune these named constants in `MoveForward.cpp`:
 
-- `SINGLE_WALL_KP = 1.5`: PWM per millimeter of distance error.
-- `SINGLE_WALL_KI = 0.05`: PWM per accumulated millimeter-second.
-- `SINGLE_WALL_KD = 0.08`: PWM per millimeter/second of error change.
+- `SINGLE_WALL_KP = 3.0`: PWM per millimeter of distance error.
+- `SINGLE_WALL_KI = 0.0`: no accumulated distance correction.
+- `SINGLE_WALL_KD = 0.05`: light damping per millimeter/second of error change.
 - `SINGLE_WALL_MAX_PWM = 40`: maximum wall correction, further limited by current approach speed and minimum motor PWM 30.
 
 The PID uses actual sample time. State resets at each run, on a wall-side change, on return to two-wall mode, and inside the distance tolerance band. Conditional integration limits windup using the available motor-speed range. Derivative action can reduce a correction as error improves; outside the band, the output is restricted to the established correction direction. These are initial hardware tuning gains.
 
-`SingleWallControl.h` owns wall-mode detection and the one-wall control law. `YawEstimate.h` owns the tested Kalman calculation and yaw integration. `MpuYaw.h` initializes the MPU6500 at 0x68 on the existing SDA 21/SCL 22 bus, calibrates offsets while stationary, and uses DLPF_6 / +/-500 dps. The filter retains measurement error 2, initial estimate error 2, Q=0.01, and the 0.5 dps deadband before filtering. Checked gyro reads use the same offset/range conversion as the [MPU6500_WE source](https://github.com/wollewald/MPU9250_WE/blob/main/src/MPU6500_WE.cpp). Install the MPU9250_WE library providing MPU6500_WE.h, as for the tested calibration sketch.
+`MoveForward.h` owns wall-mode detection and the one-wall control law. The private MPU implementation in `MoveForward.cpp` uses direct MPU6050 register reads at address 0x68 on the existing SDA 21/SCL 22 bus. It verifies the identity, calibrates Z-axis bias from 200 stationary samples, selects DLPF_6 and the +/-500 dps range, applies a 0.5 dps deadband, and integrates yaw without a software Kalman filter. A control-loop delay longer than 100 ms skips that unsafe integration interval but does not permanently invalidate a successful fresh reading.
 
-**Before enabling case 2:** set `MPU_YAW_SIGN` to +1 if the tested MPU yaw increases during a physical clockwise/right turn, or -1 if it decreases. The current sketch has -1, preserving your selected setting. A value of 0 disables case 2. Never guess this sign. All controller yaw values are normalized to right-positive after applying the sign.
+The MPU reader matches the rotation mechanism and reports physical clockwise/right turns as positive. `MPU_YAW_SIGN` remains available for mounting correction; the current value is +1. A value of 0 disables case 2. All controller yaw values are normalized to right-positive after applying the sign.
 
 At each start, relative yaw is zeroed once. Keep the robot level and parallel to the intended corridor direction at that moment. Yaw is not reset at individual cell boundaries or when switching wall modes, so accumulated heading error is not accepted as a new straight direction. Gyro yaw is relative and can drift; this is for the short seven-cell test, not long-term localization.
 
@@ -76,9 +90,9 @@ Initial `SINGLE_WALL_SETTINGS` values:
 | Distance deadband | +/-3.6 mm |
 | Wall correction | PID reduction up to 40 PWM; motor command floor 30 |
 | MPU use | Only within the wall-distance tolerance band |
-| Heading proportional gain | 1 PWM/degree |
-| Yaw-rate damping | 0.10 PWM/(degree/second) |
-| Maximum MPU trim | 5 PWM |
+| Heading proportional gain | 2 PWM/degree |
+| Yaw-rate damping | 0.15 PWM/(degree/second) |
+| Maximum MPU trim | 15 PWM |
 | Minimum commanded motor PWM | 30, before balance factors |
 
 The one-wall controller only slows a wheel; it never raises either above the existing distance-PID approach speed. During the final approach, available steering reduction shrinks to preserve the minimum command. Single-wall targets reuse the case-1 thresholds: 40 mm left and 40 mm corrected right. Verify actual chassis clearance during hardware tuning. Case-1 behavior is unchanged apart from applying the known right-sensor inset correction.
@@ -87,14 +101,15 @@ Test a left-only corridor and then a right-only corridor. Telemetry labels case 
 
 ## Case 3: no side walls
 
-When neither side wall is detected, `NoWallControl.h` holds the direction using calibrated encoder progress only. Entering case 3 captures the current left/right counts, so corrections made before the open area do not create an immediate encoder error. If either wall returns, the controller resets and the movement loop switches to case 1 or case 2 on that sample. Case 3 does not require a healthy MPU or use yaw in its steering command.
+When neither side wall is detected, the no-wall controller in `MoveForward.h` combines calibrated encoder progress with MPU yaw. Entering case 3 captures the current left/right counts, so corrections made before the open area do not create an immediate encoder error. While the MPU is healthy, steering is an 80% MPU / 20% encoder blend; opposing corrections cancel instead of slowing both motors. If either wall returns, the controller resets and the movement loop switches to case 1 or case 2 on that sample. Case 3 falls back to 100% encoder control if the MPU is unavailable.
 
 Positive encoder correction slows the left motor; negative correction slows the right motor. The user verified that each physical motor and encoder has the same left/right label, so the wheel ahead in calibrated travel must be slowed. The active case-3 PID is:
 
 - Encoder PID: Kp = 1.7, Ki = 0.10, Kd = 0.0.
 - Encoder PID output limit = 40 PWM.
+- MPU heading trim: Kp = 2.0, yaw-rate damping = 1.5, output limit = 15 PWM, blend weight = 80%.
 
-Encoder error compares distance progress using the two manual seven-cell trials: 4363/4360 and 4265/4283 ticks. Their averages are 4314 left and 4321.5 right over 1260 mm, or about 616.286/617.357 ticks per cell. Comparing normalized progress means this expected count difference represents equal travel rather than steering error. Telemetry labels this mode `none:encoder` and prints encoder error/PWM. On this robot, extra left-encoder progress reduces the left command, and extra right-encoder progress reduces the right command. Ki corrects persistent residual imbalance; conditional integration prevents windup while the output is limited.
+Encoder error compares distance progress using the two manual seven-cell trials: 4363/4360 and 4265/4283 ticks. Their averages are 4314 left and 4321.5 right over 1260 mm, or about 616.286/617.357 ticks per cell. Comparing normalized progress means this expected count difference represents equal travel rather than steering error. Telemetry labels this mode `none:encoder+MPU` and prints encoder error/PWM and MPU trim. On this robot, extra left-encoder progress reduces the left command, and extra right-encoder progress reduces the right command. Ki corrects persistent residual imbalance; conditional integration prevents windup while the output is limited.
 
 ## Verification
 
@@ -102,11 +117,11 @@ Start parallel to a straight corridor and keep d available. At readings 32/68 mm
 
 Host checks:
 
-- `tests/single_wall_test.cpp`: wall classification/hysteresis, both one-wall sides, heading/rate corrections, command bounds, Kalman/deadband integration, and stale-data rejection.
+- `tests/single_wall_test.cpp`: wall classification/hysteresis, both one-wall sides, heading/rate corrections, and command bounds.
 - `tests/cell_approach_test.cpp`: distance-PID deceleration, output limits, reset, anti-windup, and brake-lead arithmetic.
 - `tests/forward_wall_control_test.cpp`: recorded sensor examples, threshold boundaries, left-first priority, invalid-side handling, and joint encoder braking.
 - `tests/check_movement_sequence.ps1`: extracts the actual movement functions and runs them with fake time, sensors, and motors; checks continuous seven-cell travel without intermediate stops, joint braking, front readings of 39/40/41 mm, obstacle detection during motion, d during motion, and cancellation after sensor faults.
 - `tests/no_wall_test.cpp`: checks case 3 reference capture, the manual left/right calibration, both steering directions, integral correction, and anti-windup.
-- `tests/movement_commands_test.cpp`: USB/WiFi command parsing.
+- `tests/movement_commands_test.cpp`: USB/Bluetooth command parsing.
 
 These checks passed with g++ using C++11 and warnings as errors. They do not simulate mechanical dynamics. ESP32 compilation and physical verification remain pending.

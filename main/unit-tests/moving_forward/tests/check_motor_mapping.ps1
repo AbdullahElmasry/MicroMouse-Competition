@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$sketch = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../moving_forward.ino') -Raw
+$sketch = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../MoveForward.cpp') -Raw
 $definitions = [regex]::Matches($sketch, 'constexpr (?:int|float) (?:LEFT_IN1|RIGHT_IN1|LEFT_FACTOR|RIGHT_FACTOR)\s*=[^;]+;')
 if ($definitions.Count -ne 4) { throw 'Motor configuration not found' }
 $begin = $sketch.IndexOf('void motor(')
