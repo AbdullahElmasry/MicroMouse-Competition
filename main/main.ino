@@ -1,284 +1,312 @@
-#include <Wire.h>
-#include <VL6180X.h>
-#include <VL53L1X.h>
+#include <Arduino.h>
+#include <WiFi.h>
 
-// ==========================================
-// 1. التعريفات الأساسية
-// ==========================================
+#include "DemoMotion.h"
+#include "MazeMap.h"
+#include "WebDashboard.h"
+#include "config.h"
+#include "rotation.h"
 
-#define MOTOR_LEFT_IN1 25
-#define MOTOR_LEFT_IN2 26
-#define MOTOR_RIGHT_IN1 27
-#define MOTOR_RIGHT_IN2 14
-#define MOTOR_EN_PIN 23 
+MazeMap maze;
+bool rotationReady = false;
+bool explorerRunning = false;
+unsigned long completedCells = 0;
+int robotX = 0;
+int robotY = 0;
+Direction robotHeading = Direction::North;
 
-#define ENCODER_LEFT_C1 33
-#define ENCODER_RIGHT_C1 35
-
-#define XSHUT_LEFT 4
-#define XSHUT_RIGHT 5
-#define XSHUT_FRONT 16 
-
-volatile long leftTicks = 0;
-volatile long rightTicks = 0;
-
-// ==========================================
-// بارامترات الحركة والمسافات (المعايرة الخاصة بك)
-// ==========================================
-
-int targetTicks = 600;          // نبضات الخلية الواحدة (18 سم)
-int ticksPer90Degree = 620;     // النبضات الدقيقة للفة 90 درجة 
-
-// معاملات توازن المواتير
-float leftMotorFactor = 1.0;  
-float rightMotorFactor = 0.78; 
-
-// السرعات
-int baseSpeed     = 70;  // سرعة الحركة المستقيمة
-int slowSpeed     = 30;  // سرعة التعديل الجانبي
-int maxTurnSpeed  = 90;  // سرعة الدوران القصوى
-int minTurnSpeed  = 60;  // سرعة التهدئة قبل الوقوف (Soft Stop)
-
-// حدود الاقتراب والحيطان بالملليمتر
-int leftThreshold    = 40;   
-int rightThreshold   = 50;   
-int frontThreshold   = 100;  
-int wallOpenDistance = 140; // لو المسافة أكبر من 14 سم، يعتبر المسار مفتوح
-
-// كائنات حساسات الـ ToF
-VL6180X tofLeft;
-VL6180X tofRight;
-VL53L1X tofFront; 
-
-// ==========================================
-// 2. الدوال الأساسية للمواتير واللف بالانكودر
-// ==========================================
-
-void IRAM_ATTR countLeft() { leftTicks++; }
-void IRAM_ATTR countRight() { rightTicks++; }
-
-void setMotorSpeed(int speedLeft, int speedRight) {
-  int balancedLeftSpeed = speedLeft * leftMotorFactor;
-  int balancedRightSpeed = speedRight * rightMotorFactor;
-
-  if (balancedLeftSpeed > 0) {
-    analogWrite(MOTOR_LEFT_IN1, balancedLeftSpeed);           
-    analogWrite(MOTOR_LEFT_IN2, 0);   
-  } else if (balancedLeftSpeed < 0) {
-    analogWrite(MOTOR_LEFT_IN1, 0); 
-    analogWrite(MOTOR_LEFT_IN2, abs(balancedLeftSpeed));              
-  } else {
-    analogWrite(MOTOR_LEFT_IN1, 255); 
-    analogWrite(MOTOR_LEFT_IN2, 255);
-  }
-
-  if (balancedRightSpeed > 0) {
-    analogWrite(MOTOR_RIGHT_IN1, 0);
-    analogWrite(MOTOR_RIGHT_IN2, balancedRightSpeed);
-  } else if (balancedRightSpeed < 0) {
-    analogWrite(MOTOR_RIGHT_IN1, abs(balancedRightSpeed));
-    analogWrite(MOTOR_RIGHT_IN2, 0);
-  } else {
-    analogWrite(MOTOR_RIGHT_IN1, 255); 
-    analogWrite(MOTOR_RIGHT_IN2, 255);
-  }
+void publishState(const char *status) {
+  dashboardUpdateMap(
+      maze, robotX, robotY, robotHeading, explorerRunning, status);
 }
 
-// دالة الدوران الدقيقة بالانكودر (بعد تعديل الاتجاهات)
-void turnEncoder(float angleDeg) {
-  leftTicks = 0;
-  rightTicks = 0;
-  
-  long requiredTicks = (abs(angleDeg) / 90.0) * ticksPer90Degree;
-  
-  while (leftTicks < requiredTicks && rightTicks < requiredTicks) {
-    int currentTurnSpeed = maxTurnSpeed;
-    
-    // تهدئة السرعة (Soft Stop) لامتصاص القصور الذاتي
-    long avgTicks = (leftTicks + rightTicks) / 2;
-    if (requiredTicks - avgTicks < 70) {
-      currentTurnSpeed = minTurnSpeed;
-    }
-
-    // تم عكس الإشارات لتصحيح اتجاه الدوران
-    if (angleDeg > 0) {
-      setMotorSpeed(-currentTurnSpeed, currentTurnSpeed); // دوران يمين
-    } else {
-      setMotorSpeed(currentTurnSpeed, -currentTurnSpeed); // دوران شمال
-    }
-    delay(2);
-  }
-
-  setMotorSpeed(0, 0); // فرملة تامة
-  delay(100); // راحة بسيطة جداً بعد اللف
+void logPose(const char *event) {
+  const MazeCell &cell = maze.cell(robotX, robotY);
+  char line[180];
+  snprintf(line, sizeof(line),
+           "POSE | %s | cell=(%d,%d) | heading=%s | flood=%u | moves=%lu",
+           event, robotX, robotY, MazeMap::directionName(robotHeading),
+           cell.distance, completedCells);
+  demoLog(line);
 }
 
-// ==========================================
-// 3. دالة التحرك خلية واحدة
-// ==========================================
-
-void moveOneCell() {
-  leftTicks = 0;
-  rightTicks = 0;
-  
-  while (true) {
-    if (leftTicks >= targetTicks || rightTicks >= targetTicks) {
-      setMotorSpeed(0, 0); 
-      break;
-    }
-    
-    int distFront = tofFront.read();
-    if (distFront < frontThreshold && !tofFront.timeoutOccurred()) {
-      setMotorSpeed(0, 0);
-      break; 
-    }
-
-    int distLeft = tofLeft.readRangeSingleMillimeters();
-    int distRight = tofRight.readRangeSingleMillimeters();
-    
-    int currentLeftSpeed = baseSpeed;
-    int currentRightSpeed = baseSpeed;
-    
-    // تعديل المسار الجانبي بنعومة
-    if (distLeft < leftThreshold && !tofLeft.timeoutOccurred()) {
-      currentLeftSpeed = slowSpeed;  
-      currentRightSpeed = baseSpeed; 
-    } 
-    else if (distRight < rightThreshold && !tofRight.timeoutOccurred()) {
-      currentLeftSpeed = baseSpeed;  
-      currentRightSpeed = slowSpeed; 
-    } 
-    
-    setMotorSpeed(currentLeftSpeed, currentRightSpeed);
-    delay(10); 
-  }
+bool stopRequested() {
+  if (demoReadCommand() == MovementCommand::Stop) moveForwardStop();
+  return demoStopped();
 }
 
-// ==========================================
-// 4. التصحيح المطلق (Front Wall Calibration)
-// ==========================================
-// لو الروبوت زحف شوية قدام الحيطة السد، الدالة دي هترجعه أو تقدمه لمكانه المثالي بالمللي
-void calibrateWithFrontWall() {
-  unsigned long startMs = millis();
-  
-  while (true) {
-    int distFront = tofFront.read();
-    if (tofFront.timeoutOccurred() || millis() - startMs > 600) break; 
-    
-    int error = distFront - frontThreshold;
-    if (abs(error) <= 3) break; // نسبة سماحية 3 مم
-
-    int alignSpeed = error * 2; 
-    if (alignSpeed > 0) {
-      alignSpeed = constrain(alignSpeed, 35, slowSpeed); 
-    } else {
-      alignSpeed = constrain(alignSpeed, -slowSpeed, -35); 
-    }
-
-    setMotorSpeed(alignSpeed, alignSpeed);
-    delay(5);
-  }
-  
-  setMotorSpeed(0, 0);
-  delay(50); 
+bool settle() {
+  const unsigned long started = millis();
+  do {
+    if (stopRequested()) return false;
+    delay(1);
+  } while (millis() - started < SETTLE_MS);
+  return true;
 }
 
-// ==========================================
-// 5. Setup
-// ==========================================
+void stopExplorer(const char *reason) {
+  stopRotation();
+  demoEndRun();
+  explorerRunning = false;
+  demoLog(reason);
+  logPose("STOPPED");
+  publishState(reason);
+}
+
+void resetMap() {
+  maze.reset();
+  robotX = 0;
+  robotY = 0;
+  robotHeading = Direction::North;
+  completedCells = 0;
+  demoLog("MAP RESET | start=(0,0) | heading=NORTH | goal=(7,7)-(8,8)");
+  logPose("RESET");
+  publishState("Ready");
+}
+
+bool readOpenPaths(bool &frontOpen, bool &leftOpen, bool &rightOpen,
+                   int &frontMm, int &leftMm, int &rightMm) {
+  frontOpen = leftOpen = rightOpen = true;
+  frontMm = leftMm = rightMm = 32767;
+  for (int sample = 0; sample < OPEN_CONFIRM_SAMPLES; ++sample) {
+    if (stopRequested()) return false;
+    int front, left, right;
+    if (!demoReadPaths(front, left, right)) return false;
+    frontOpen = frontOpen && front > FRONT_OPEN_MM;
+    leftOpen = leftOpen && left > SIDE_OPEN_MM;
+    rightOpen = rightOpen && right > SIDE_OPEN_MM;
+    if (front < frontMm) frontMm = front;
+    if (left < leftMm) leftMm = left;
+    if (right < rightMm) rightMm = right;
+  }
+  char line[180];
+  snprintf(line, sizeof(line),
+           "SENSORS | F=%s %dmm | L=%s %dmm | R=%s %dmm",
+           frontOpen ? "OPEN" : "WALL", frontMm,
+           leftOpen ? "OPEN" : "WALL", leftMm,
+           rightOpen ? "OPEN" : "WALL", rightMm);
+  demoLog(line);
+  return !stopRequested();
+}
+
+void updateMapFromScan(bool frontOpen, bool leftOpen, bool rightOpen) {
+  const int conflicts = maze.observe(
+      robotX, robotY, robotHeading, !frontOpen, !leftOpen, !rightOpen);
+  maze.floodFill();
+  char line[180];
+  snprintf(line, sizeof(line),
+           "MAP | cell=(%d,%d) heading=%s | walls F/L/R=%d/%d/%d | conflicts=%d",
+           robotX, robotY, MazeMap::directionName(robotHeading),
+           !frontOpen, !leftOpen, !rightOpen, conflicts);
+  demoLog(line);
+  if (conflicts) {
+    demoLog("MAP WARNING | sensor result changed a previously known wall");
+  }
+  publishState("Mapping");
+}
+
+bool turnAndSettle(float degrees) {
+  if (stopRequested() || !turnDegrees(degrees)) return false;
+  return settle();
+}
+
+bool turnTo(Direction target) {
+  const int change = ((int)target - (int)robotHeading + 4) % 4;
+  char line[120];
+  snprintf(line, sizeof(line), "TURN PLAN | %s -> %s",
+           MazeMap::directionName(robotHeading),
+           MazeMap::directionName(target));
+  demoLog(line);
+
+  bool ok = true;
+  if (change == 1) ok = turnAndSettle(-90.0f);
+  else if (change == 3) ok = turnAndSettle(90.0f);
+  else if (change == 2)
+    ok = turnAndSettle(-90.0f) && turnAndSettle(-90.0f);
+  if (ok) robotHeading = target;
+  return ok;
+}
+
+bool alignArrivalHeading() {
+  if (!settle()) return false;
+  float yawRight;
+  if (!demoHeadingError(yawRight)) {
+    demoLog("ALIGN | MPU unavailable; cannot correct heading");
+    return false;
+  }
+  char line[120];
+  if (fabsf(yawRight) <= ARRIVAL_YAW_TOLERANCE_DEG) {
+    snprintf(line, sizeof(line), "ALIGN | yaw=%+.2fdeg | within tolerance",
+             yawRight);
+    demoLog(line);
+    return !stopRequested();
+  }
+  snprintf(line, sizeof(line),
+           "ALIGN | yaw=%+.2fdeg | rotate in place to cardinal heading",
+           yawRight);
+  demoLog(line);
+  return turnAndSettle(yawRight);
+}
+
+void runFloodStep() {
+  if (!settle()) {
+    stopExplorer("STOP | command received before scan");
+    return;
+  }
+
+  char line[180];
+  snprintf(line, sizeof(line), "STEP %lu | scan cell=(%d,%d) heading=%s",
+           completedCells + 1, robotX, robotY,
+           MazeMap::directionName(robotHeading));
+  demoLog(line);
+
+  bool frontOpen, leftOpen, rightOpen;
+  int frontMm, leftMm, rightMm;
+  if (!readOpenPaths(frontOpen, leftOpen, rightOpen,
+                     frontMm, leftMm, rightMm)) {
+    stopExplorer(demoStopped()
+        ? "STOP | scan cancelled"
+        : "FAULT | scan failed after retries; see SCAN ERROR");
+    return;
+  }
+  updateMapFromScan(frontOpen, leftOpen, rightOpen);
+  logPose("SCANNED");
+
+  if (maze.isGoal(robotX, robotY)) {
+    stopExplorer("GOAL | center reached; exploration complete");
+    return;
+  }
+
+  Direction selected;
+  if (!maze.chooseNext(robotX, robotY, robotHeading, selected)) {
+    stopExplorer("FAULT | flood fill found no reachable neighbor");
+    return;
+  }
+  const int nextX = robotX + MazeMap::dx(selected);
+  const int nextY = robotY + MazeMap::dy(selected);
+  snprintf(line, sizeof(line),
+           "FLOOD | current=%u | choose=%s | next=(%d,%d) distance=%u visited=%d",
+           maze.cell(robotX, robotY).distance,
+           MazeMap::directionName(selected), nextX, nextY,
+           maze.cell(nextX, nextY).distance,
+           maze.cell(nextX, nextY).visited);
+  demoLog(line);
+
+  if (!turnTo(selected)) {
+    stopExplorer("FAULT | navigation turn stopped or failed");
+    return;
+  }
+
+  demoLog("CHECK | verify selected cell after turn");
+  if (!readOpenPaths(frontOpen, leftOpen, rightOpen,
+                     frontMm, leftMm, rightMm)) {
+    stopExplorer(demoStopped()
+        ? "STOP | post-turn scan cancelled"
+        : "FAULT | post-turn scan failed");
+    return;
+  }
+  updateMapFromScan(frontOpen, leftOpen, rightOpen);
+  if (!frontOpen) {
+    demoLog("REPLAN | selected edge is now blocked; remain in current cell");
+    publishState("Replanning");
+    return;
+  }
+
+  if (stopRequested()) {
+    stopExplorer("STOP | command received before movement");
+    return;
+  }
+  snprintf(line, sizeof(line), "MOVE PLAN | (%d,%d) -> (%d,%d) heading=%s",
+           robotX, robotY, nextX, nextY,
+           MazeMap::directionName(robotHeading));
+  demoLog(line);
+  const DemoMoveResult outcome = demoMoveOneCell();
+  if (outcome == DemoMoveResult::Stopped ||
+      outcome == DemoMoveResult::Failed) {
+    stopExplorer(outcome == DemoMoveResult::Stopped
+        ? "STOP | cell movement cancelled"
+        : "FAULT | cell movement failed; coordinates unchanged");
+    return;
+  }
+  demoLog(outcome == DemoMoveResult::FrontWallReached
+      ? "ARRIVAL | front-wall reference reached"
+      : "ARRIVAL | encoder target reached");
+  if (!alignArrivalHeading()) {
+    stopExplorer("FAULT | arrival heading correction failed");
+    return;
+  }
+
+  const int oldX = robotX;
+  const int oldY = robotY;
+  robotX += MazeMap::dx(robotHeading);
+  robotY += MazeMap::dy(robotHeading);
+  if (!maze.inBounds(robotX, robotY)) {
+    robotX = oldX;
+    robotY = oldY;
+    stopExplorer("FAULT | move would place pose outside maze");
+    return;
+  }
+  maze.markTraversed(oldX, oldY, robotHeading);
+  maze.floodFill();
+  ++completedCells;
+  logPose("CELL REACHED");
+  publishState(maze.isGoal(robotX, robotY)
+      ? "Center reached; final scan pending"
+      : "Exploring");
+}
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(); 
-  
-  pinMode(MOTOR_EN_PIN, OUTPUT);
-  digitalWrite(MOTOR_EN_PIN, HIGH); 
-  
-  pinMode(MOTOR_LEFT_IN1, OUTPUT);
-  pinMode(MOTOR_LEFT_IN2, OUTPUT);
-  pinMode(MOTOR_RIGHT_IN1, OUTPUT);
-  pinMode(MOTOR_RIGHT_IN2, OUTPUT);
+  rotationReady = beginRotation();
+  moveForwardSetup();
+  demoEndRun();
 
-  pinMode(ENCODER_LEFT_C1, INPUT_PULLUP); 
-  pinMode(ENCODER_RIGHT_C1, INPUT);       
-  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_C1), countLeft, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_C1), countRight, RISING);
+  maze.reset();
+  dashboardBegin();
+  resetMap();
 
-  pinMode(XSHUT_LEFT, OUTPUT);
-  pinMode(XSHUT_RIGHT, OUTPUT);
-  pinMode(XSHUT_FRONT, OUTPUT);
-  
-  digitalWrite(XSHUT_LEFT, LOW);
-  digitalWrite(XSHUT_RIGHT, LOW);
-  digitalWrite(XSHUT_FRONT, LOW);
-  delay(10);
-  
-  digitalWrite(XSHUT_LEFT, HIGH);
-  delay(50);
-  tofLeft.init();
-  tofLeft.configureDefault();
-  tofLeft.setAddress(0x30); 
-  tofLeft.setTimeout(200); 
-
-  digitalWrite(XSHUT_RIGHT, HIGH);
-  delay(50);
-  tofRight.init();
-  tofRight.configureDefault();
-  tofRight.setAddress(0x31); 
-  tofRight.setTimeout(200);
-
-  digitalWrite(XSHUT_FRONT, HIGH);
-  delay(50);
-  tofFront.init();
-  tofFront.setDistanceMode(VL53L1X::Medium); 
-  tofFront.setAddress(0x32); 
-  tofFront.setTimeout(200);
-  tofFront.startContinuous(30); 
-
-  Serial.println("الروبوت جاهز لاجتياز المتاهة...");
-  delay(2000); 
+  demoLog("BUILD | flood-fill exploration-v1 | speed run disabled");
+  demoLog("COMMANDS | s/start begins or resumes | d/stop stops | web reset clears map");
+  demoLog("COORDINATES | start=(0,0), north=+Y, east=+X");
+  if (WiFi.status() == WL_CONNECTED) {
+    char url[80];
+    snprintf(url, sizeof(url), "WEB | open http://%s/",
+             WiFi.localIP().toString().c_str());
+    demoLog(url);
+  }
+  demoLog(rotationReady && demoMotionReady()
+      ? "READY | open the web page or send s/start"
+      : "FAULT | rotation, MPU or ToF initialization failed");
+  publishState(rotationReady && demoMotionReady()
+      ? "Ready" : "Initialization failed");
 }
 
-// ==========================================
-// 6. Loop (الملاحة واتخاذ القرار)
-// ==========================================
-
 void loop() {
-  // 1. تحرك خلية واحدة للأمام
-  moveOneCell();
-  
-  delay(200); // وقفة خفيفة في مركز الخلية قبل أخذ القراءات
-
-  // 2. قراءة المسافات لتحديد الاتجاهات المتاحة
-  int distLeft = tofLeft.readRangeSingleMillimeters();
-  int distRight = tofRight.readRangeSingleMillimeters();
-  int distFront = tofFront.read();
-
-  bool leftOpen  = (distLeft > wallOpenDistance) || tofLeft.timeoutOccurred();
-  bool rightOpen = (distRight > wallOpenDistance) || tofRight.timeoutOccurred();
-  bool frontOpen = (distFront > frontThreshold) && !tofFront.timeoutOccurred();
-
-  // 3. معايرة الأوفر شوت (لو قدامه حيطة سد هيستغلها لضبط المسافة بالمللي)
-  if (!frontOpen) {
-    calibrateWithFrontWall();
+  dashboardLoop();
+  if (dashboardTakeReset()) {
+    if (explorerRunning) stopExplorer("STOP | web map reset requested");
+    resetMap();
   }
 
-  // 4. خوارزمية اتخاذ القرار بالانكودر
-  if (leftOpen) {
-    Serial.println("شمال فاضي -> لف شمال");
-    turnEncoder(-90.0); // الدوران شمال
-  } 
-  else if (rightOpen) {
-    Serial.println("يمين فاضي -> لف يمين");
-    turnEncoder(90.0);  // الدوران يمين
-  } 
-  else if (!frontOpen) {
-    Serial.println("طريق مسدود -> لف 180 للرجوع");
-    turnEncoder(180.0); // الدوران 180
-  }
-  else {
-    Serial.println("طريق سالك -> مكمل لقدام");
+  const MovementCommand command = demoReadCommand();
+  if (command == MovementCommand::Stop) {
+    if (explorerRunning) stopExplorer("STOP | command received");
+  } else if (command == MovementCommand::Start && !explorerRunning) {
+    if (!rotationReady || !demoMotionReady()) {
+      demoLog("REFUSED | rotation, MPU or ToF unavailable; reset ESP32");
+      publishState("Initialization fault");
+    } else if (maze.isGoal(robotX, robotY)) {
+      demoLog("REFUSED | goal already reached; reset the map for another run");
+    } else {
+      demoBeginRun();
+      explorerRunning = true;
+      demoLog("START | flood-fill exploration; speed run disabled");
+      logPose("START");
+      publishState("Exploring");
+    }
   }
 
-  delay(200); // راحة بسيطة قبل ما يندفع للخلية اللي بعدها
+  if (explorerRunning) runFloodStep();
+  dashboardLoop();
+  delay(10);
 }
