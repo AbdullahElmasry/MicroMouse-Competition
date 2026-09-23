@@ -10,6 +10,7 @@ enum class Direction : uint8_t { North = 0, East = 1, South = 2, West = 3 };
 struct MazeCell {
   uint8_t walls = 0;
   uint8_t known = 0;
+  uint8_t traversed = 0;
   bool visited = false;
   uint16_t distance = FLOOD_UNREACHABLE;
 };

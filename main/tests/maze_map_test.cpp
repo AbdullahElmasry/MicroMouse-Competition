@@ -31,6 +31,9 @@ int main() {
   maze.markTraversed(0, 0, Direction::East);
   assert((maze.cell(0, 0).walls & (1U << (uint8_t)Direction::East)) == 0);
   assert((maze.cell(1, 0).walls & (1U << (uint8_t)Direction::West)) == 0);
+  assert(maze.observe(1, 0, Direction::North, false, true, false) == 1);
+  assert((maze.cell(0, 0).walls & (1U << (uint8_t)Direction::East)) == 0);
+  assert((maze.cell(1, 0).walls & (1U << (uint8_t)Direction::West)) == 0);
 
   assert(MazeMap::leftOf(Direction::North) == Direction::West);
   assert(MazeMap::rightOf(Direction::North) == Direction::East);

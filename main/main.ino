@@ -100,7 +100,7 @@ void updateMapFromScan(bool frontOpen, bool leftOpen, bool rightOpen) {
            !frontOpen, !leftOpen, !rightOpen, conflicts);
   demoLog(line);
   if (conflicts) {
-    demoLog("MAP WARNING | sensor result changed a previously known wall");
+    demoLog("MAP WARNING | sensor disagrees with known edge; traversed openings stay open");
   }
   publishState("Mapping");
 }
@@ -155,9 +155,10 @@ void runFloodStep() {
   }
 
   char line[180];
-  snprintf(line, sizeof(line), "STEP %lu | scan cell=(%d,%d) heading=%s",
-           completedCells + 1, robotX, robotY,
-           MazeMap::directionName(robotHeading));
+  snprintf(line, sizeof(line), "========== STEP %lu | CELL (%d,%d) | %s ==========",
+          completedCells + 1, robotX, robotY,
+          MazeMap::directionName(robotHeading));
+  demoLog("");
   demoLog(line);
 
   bool frontOpen, leftOpen, rightOpen;
@@ -231,7 +232,7 @@ void runFloodStep() {
   demoLog(outcome == DemoMoveResult::FrontWallReached
       ? "ARRIVAL | front-wall reference reached"
       : "ARRIVAL | encoder target reached");
-  if (!alignArrivalHeading()) {
+  if (!maze.isGoal(nextX, nextY) && !alignArrivalHeading()) {
     stopExplorer("FAULT | arrival heading correction failed");
     return;
   }
@@ -250,9 +251,11 @@ void runFloodStep() {
   maze.floodFill();
   ++completedCells;
   logPose("CELL REACHED");
-  publishState(maze.isGoal(robotX, robotY)
-      ? "Center reached; final scan pending"
-      : "Exploring");
+  if (maze.isGoal(robotX, robotY)) {
+    stopExplorer("GOAL | center reached; exploration complete");
+    return;
+  }
+  publishState("Exploring");
 }
 
 void setup() {

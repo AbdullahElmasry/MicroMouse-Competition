@@ -8,11 +8,18 @@
 #include "config.h"
 #include "WebDashboard.h"
 
+constexpr int MPU_I2C_ATTEMPTS = 10;
+constexpr unsigned long MPU_I2C_RETRY_MS = 1000;
+
 class MpuYaw {
  public:
   bool begin() {
     uint8_t identity;
-    if (!readBytes(0x75, &identity, 1) || identity != 0x68) return false;
+    if (!readBytes(0x75, &identity, 1)) return false;
+    if (identity != 0x68) {
+      Serial.printf("MPU INIT ERROR | WHO_AM_I=0x%02X expected=0x68\n", identity);
+      return false;
+    }
     if (!writeByte(0x6B, 0x01)) return false;
     delay(100);
     if (!writeByte(0x1A, 0x06) || !writeByte(0x1B, 0x08)) return false;
@@ -21,7 +28,10 @@ class MpuYaw {
     float sum = 0.0f;
     for (int i = 0; i < 200; ++i) {
       float rate;
-      if (!readGyroZ(rate)) return false;
+      if (!readGyroZ(rate)) {
+        Serial.printf("MPU INIT ERROR | gyro calibration sample=%d/200\n", i + 1);
+        return false;
+      }
       sum += rate;
       delay(10);
     }
@@ -70,21 +80,48 @@ class MpuYaw {
 
  private:
   bool readBytes(uint8_t reg, uint8_t *data, uint8_t count) {
-    Wire.beginTransmission(0x68);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0 ||
-        Wire.requestFrom((uint8_t)0x68, count) != count) {
-      return false;
+    const unsigned long started = millis();
+    const char *failedStage = "select";
+    int detail = 0;
+    for (int attempt = 1; attempt <= MPU_I2C_ATTEMPTS; ++attempt) {
+      Wire.beginTransmission(0x68);
+      Wire.write(reg);
+      const uint8_t status = Wire.endTransmission(false);
+      if (status == 0) {
+        const uint8_t received = Wire.requestFrom((uint8_t)0x68, count);
+        if (received == count) {
+          for (uint8_t i = 0; i < count; ++i) data[i] = Wire.read();
+          return true;
+        }
+        failedStage = "read bytes";
+        detail = received;
+      } else {
+        failedStage = "select I2C";
+        detail = status;
+      }
+      if (millis() - started >= MPU_I2C_RETRY_MS) break;
+      if (attempt < MPU_I2C_ATTEMPTS) delay(5);
     }
-    for (uint8_t i = 0; i < count; ++i) data[i] = Wire.read();
-    return true;
+    Serial.printf("MPU I2C ERROR | reg=0x%02X | stage=%s | detail=%d | expected bytes=%u | elapsed=%lums\n",
+                  reg, failedStage, detail, count, millis() - started);
+    return false;
   }
 
   bool writeByte(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(0x68);
-    Wire.write(reg);
-    Wire.write(value);
-    return Wire.endTransmission() == 0;
+    const unsigned long started = millis();
+    uint8_t status = 0;
+    for (int attempt = 1; attempt <= MPU_I2C_ATTEMPTS; ++attempt) {
+      Wire.beginTransmission(0x68);
+      Wire.write(reg);
+      Wire.write(value);
+      status = Wire.endTransmission();
+      if (status == 0) return true;
+      if (millis() - started >= MPU_I2C_RETRY_MS) break;
+      if (attempt < MPU_I2C_ATTEMPTS) delay(5);
+    }
+    Serial.printf("MPU I2C ERROR | write reg=0x%02X | I2C=%u | elapsed=%lums\n",
+                  reg, status, millis() - started);
+    return false;
   }
 
   bool readGyroZ(float &rate) {
@@ -127,13 +164,9 @@ constexpr int LEFT_ENCODER = 33, RIGHT_ENCODER = 35;
 
 constexpr int LEFT_XSHUT = 4, RIGHT_XSHUT = 5, FRONT_XSHUT = 16;
 
-// Two hand-pushed trials over 7 cells (1260 mm): L/R
-// 4363/4360, 4265/4283. Both trials were confirmed as 1260 mm.
-constexpr float LEFT_TICKS_PER_CELL =
-    ((4363.0f + 4265.0f) / 2.0f) / 7.0f;
-
-constexpr float RIGHT_TICKS_PER_CELL =
-    ((4360.0f + 4283.0f) / 2.0f) / 7.0f;
+// Tuned encoder target for one 180 mm cell.
+constexpr float LEFT_TICKS_PER_CELL = 623.0f;
+constexpr float RIGHT_TICKS_PER_CELL = 623.0f;
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 1;
@@ -148,9 +181,9 @@ constexpr unsigned long RIGHT_TARGET_TICKS =
     (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 616 &&
-    RIGHT_TARGET_TICKS == 617,
-    "Check one-cell targets from the tested seven-cell calibration"
+    LEFT_TARGET_TICKS == 623 &&
+    RIGHT_TARGET_TICKS == 623,
+    "Check one-cell targets against the tuned encoder calibration"
 );
 
 constexpr int FORWARD_TARGET_MM =
@@ -535,7 +568,6 @@ bool reportTofStep(const char *name, const char *step, uint8_t status) {
     return status == 0;
 }
 bool initSensors() {
-  Wire.begin();
   bool leftReady = false, rightReady = false, frontReady = false;
   // Match main.ino's sequence and settings; report diagnostics afterward.
   pinMode(LEFT_XSHUT, OUTPUT);
@@ -1022,9 +1054,6 @@ void moveForwardSetup() {
 
     drive(0, 0);
 
-    // Establish stopped motor outputs before enabling WiFi commands.
-    initWiFi();
-
     // --------------------------------------------------------
     // Encoders
     // --------------------------------------------------------
@@ -1062,17 +1091,19 @@ void moveForwardSetup() {
     // Sensors
     // --------------------------------------------------------
 
-    sensorsReady =
-        initSensors();
+    Wire.begin(21, 22);
     debugPrintln("MPU6050 calibration: keep the robot completely still.");
     bool mpuReady=mpuYaw.begin();
-    debugPrintln(mpuReady?"MPU6050 ready (direct yaw, no software Kalman filter).":"MPU failed: only two-wall mode available.");
+    debugPrintln(mpuReady?"MPU6050 ready (direct yaw, no software Kalman filter).":"MPU initialization failed; forward movement unavailable.");
     if (MPU_YAW_SIGN==0) debugPrintln("Case 2 needs MPU_YAW_SIGN: +1 for right-positive yaw, -1 for right-negative yaw.");
+    sensorsReady = initSensors();
 
     digitalWrite(
         MOTOR_EN,
         HIGH
     );
+
+    initWiFi();
 
 
     debugPrintln(

@@ -4,7 +4,7 @@
 // same 10 mm sensor-inset correction as the tested forward module.
 constexpr int SIDE_OPEN_MM = 100;
 constexpr int FRONT_OPEN_MM = 100;
-constexpr int OPEN_CONFIRM_SAMPLES = 3;
+constexpr int OPEN_CONFIRM_SAMPLES = 8;
 constexpr unsigned long SETTLE_MS = 150;
 constexpr float ARRIVAL_YAW_TOLERANCE_DEG = 1.0f;
 constexpr int FRONT_WALL_TARGET_MM = 60;

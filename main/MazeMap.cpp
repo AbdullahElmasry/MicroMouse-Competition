@@ -64,6 +64,8 @@ bool MazeMap::setWall(int x, int y, Direction direction, bool present) {
   if (!inBounds(nx, ny)) present = true;
   MazeCell &here = cells_[y][x];
   const uint8_t mask = wallBit(direction);
+  // A sensor reading cannot close an edge the robot physically crossed.
+  if (present && (here.traversed & mask)) return true;
   const bool conflict = boundaryConflict ||
       ((here.known & mask) && (((here.walls & mask) != 0) != present));
   here.known |= mask;
@@ -92,7 +94,13 @@ int MazeMap::observe(int x, int y, Direction heading,
 }
 
 void MazeMap::markTraversed(int x, int y, Direction direction) {
+  if (!inBounds(x, y)) return;
+  const int nx = x + dx(direction);
+  const int ny = y + dy(direction);
+  if (!inBounds(nx, ny)) return;
   setWall(x, y, direction, false);
+  cells_[y][x].traversed |= wallBit(direction);
+  cells_[ny][nx].traversed |= wallBit(opposite(direction));
 }
 
 bool MazeMap::canTravel(int x, int y, Direction direction) const {
