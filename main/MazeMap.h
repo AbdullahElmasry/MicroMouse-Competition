@@ -10,7 +10,6 @@ enum class Direction : uint8_t { North = 0, East = 1, South = 2, West = 3 };
 struct MazeCell {
   uint8_t walls = 0;
   uint8_t known = 0;
-  uint8_t traversed = 0;
   bool visited = false;
   uint16_t distance = FLOOD_UNREACHABLE;
 };
@@ -25,8 +24,6 @@ class MazeMap {
   void markTraversed(int x, int y, Direction direction);
   void floodFill();
   bool chooseNext(int x, int y, Direction heading, Direction &next) const;
-  int knownStraightRunLength(int x, int y, Direction direction,
-                             int maximumCells) const;
   const MazeCell &cell(int x, int y) const;
 
   static Direction leftOf(Direction direction);

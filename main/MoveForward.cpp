@@ -8,35 +8,16 @@
 #include "config.h"
 #include "WebDashboard.h"
 
-template<typename T> void debugPrintln(const T& value);
-void drive(int left, int right);
-
 class MpuYaw {
  public:
   bool begin() {
-    ready_ = false;
-    failurePhase_ = "WHO_AM_I";
-    failureOperation_ = "none";
-    failureDetail_ = 0;
-    failureAttempts_ = 0;
-    failureElapsedMs_ = 0;
     uint8_t identity;
-    if (!readBytes(0x75, &identity, 1)) return false;
-    if (identity != 0x68) {
-      failureOperation_ = "unexpected identity";
-      failureDetail_ = identity;
-      return false;
-    }
-    failurePhase_ = "wake";
+    if (!readBytes(0x75, &identity, 1) || identity != 0x68) return false;
     if (!writeByte(0x6B, 0x01)) return false;
     delay(100);
-    failurePhase_ = "filter setup";
-    if (!writeByte(0x1A, 0x06)) return false;
-    failurePhase_ = "gyro range setup";
-    if (!writeByte(0x1B, 0x08)) return false;
+    if (!writeByte(0x1A, 0x06) || !writeByte(0x1B, 0x08)) return false;
     delay(100);
 
-    failurePhase_ = "gyro bias calibration";
     float sum = 0.0f;
     for (int i = 0; i < 200; ++i) {
       float rate;
@@ -46,8 +27,6 @@ class MpuYaw {
     }
     gyroZBias_ = sum / 200.0f;
     ready_ = isfinite(gyroZBias_);
-    if (!ready_) failureOperation_ = "invalid gyro bias";
-    lastReadOk_ = ready_;
     reset();
     return ready_;
   }
@@ -60,126 +39,52 @@ class MpuYaw {
   }
 
   void service() {
-    if (!ready_ || !lastReadOk_) return;
+    if (!ready_) return;
     unsigned long now = millis();
     unsigned long elapsed = now - lastPollMs_;
     if (elapsed < 10) return;
+    lastPollMs_ = now;
 
     float gyroZ;
-    failurePhase_ = "gyro sample";
     if (!readGyroZ(gyroZ)) {
-      lastPollMs_ = millis();
-      if (lastReadOk_) logFault("read lost");
-      lastReadOk_ = false;
+      ready_ = false;
       return;
     }
-    const unsigned long sampleMs = millis();
-    const unsigned long sampleElapsed = sampleMs - lastPollMs_;
-    lastPollMs_ = sampleMs;
-    lastReadOk_ = true;
 
-    // Keep the gyro convention used by the tested MPU yaw sketch.
-    rate_ = gyroZ - gyroZBias_;
+    // Match the tested rotation integrator: positive is physical left.
+    // MPU_YAW_SIGN converts this to right-positive for forward steering.
+    rate_ = -(gyroZ - gyroZBias_);
     if (fabsf(rate_) < 0.5f) rate_ = 0.0f;
 
     // Do not integrate one sample across a long blocking sensor interval.
-    if (sampleElapsed <= 100) yaw_ += rate_ * (sampleElapsed / 1000.0f);
-    lastGoodMs_ = sampleMs;
+    if (elapsed <= 100) yaw_ += rate_ * (elapsed / 1000.0f);
+    lastGoodMs_ = now;
   }
 
   bool healthy() const {
-    return ready_ && lastReadOk_ &&
-           (unsigned long)(millis() - lastGoodMs_) <= 250;
+    return ready_ && (unsigned long)(millis() - lastGoodMs_) <= 250;
   }
 
   float yaw() const { return yaw_; }
   float rate() const { return rate_; }
-  void logFault(const char *context) const {
-    char line[230];
-    snprintf(line, sizeof(line),
-             "MPU FAULT | %s | sensor=forward MPU6050 0x68 | phase=%s | operation=%s | reg=0x%02X | detail=%d | attempts=%d | elapsed=%lums",
-             context, failurePhase_, failureOperation_, failureRegister_,
-             failureDetail_, failureAttempts_, failureElapsedMs_);
-    debugPrintln(line);
-  }
-  unsigned long lastGoodAgeMs() const { return millis() - lastGoodMs_; }
-  bool initialized() const { return ready_; }
-  bool lastReadOk() const { return lastReadOk_; }
 
  private:
   bool readBytes(uint8_t reg, uint8_t *data, uint8_t count) {
-    failureRegister_ = reg;
-    const unsigned long started = millis();
-    for (int attempt = 1; attempt <= MPU_I2C_MAX_ATTEMPTS; ++attempt) {
-      Wire.beginTransmission(0x68);
-      Wire.write(reg);
-      const uint8_t status = Wire.endTransmission(false);
-      if (status == 0) {
-        const uint8_t received = Wire.requestFrom((uint8_t)0x68, count);
-        if (received == count) {
-          for (uint8_t i = 0; i < count; ++i) data[i] = Wire.read();
-          if (attempt > 1) {
-            ++recoveredReads_;
-            if (attempt > worstRecoveryAttempt_) worstRecoveryAttempt_ = attempt;
-            const unsigned long now = millis();
-            if (lastRecoveryLogMs_ == 0 || now - lastRecoveryLogMs_ >= 1000) {
-              char line[220];
-              snprintf(line, sizeof(line),
-                       "MPU RECOVERED | forward reg=0x%02X | reads=%lu | worst=%d/%d | latest=%lums | select errors=%lu last I2C=%u | short reads=%lu last bytes=%u/%u",
-                       reg, recoveredReads_, worstRecoveryAttempt_,
-                       MPU_I2C_MAX_ATTEMPTS, now - started,
-                       selectErrors_, lastSelectStatus_, shortReads_,
-                       lastReceivedCount_, count);
-              debugPrintln(line);
-              recoveredReads_ = 0;
-              worstRecoveryAttempt_ = 0;
-              selectErrors_ = 0;
-              shortReads_ = 0;
-              lastRecoveryLogMs_ = now;
-            }
-          }
-          return true;
-        }
-        failureOperation_ = "read byte count";
-        failureDetail_ = received;
-        ++shortReads_;
-        lastReceivedCount_ = received;
-      } else {
-        failureOperation_ = "register select I2C";
-        failureDetail_ = status;
-        ++selectErrors_;
-        lastSelectStatus_ = status;
-      }
-      // Brief retries are common on the shared I2C bus. Do not interrupt
-      // the motors unless the gyro remains unavailable for too long.
-      if (ready_ && millis() - started >= MPU_RETRY_MOTOR_HOLD_MS) drive(0, 0);
-      failureAttempts_ = attempt;
-      failureElapsedMs_ = millis() - started;
-      if (attempt == MPU_I2C_MAX_ATTEMPTS ||
-          millis() - started >= MPU_I2C_RETRY_BUDGET_MS) break;
-      delay(5);
+    Wire.beginTransmission(0x68);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0 ||
+        Wire.requestFrom((uint8_t)0x68, count) != count) {
+      return false;
     }
-    return false;
+    for (uint8_t i = 0; i < count; ++i) data[i] = Wire.read();
+    return true;
   }
 
   bool writeByte(uint8_t reg, uint8_t value) {
-    failureRegister_ = reg;
-    const unsigned long started = millis();
-    for (int attempt = 1; attempt <= MPU_I2C_MAX_ATTEMPTS; ++attempt) {
-      Wire.beginTransmission(0x68);
-      Wire.write(reg);
-      Wire.write(value);
-      const uint8_t status = Wire.endTransmission();
-      if (status == 0) return true;
-      failureOperation_ = "register write I2C";
-      failureDetail_ = status;
-      failureAttempts_ = attempt;
-      failureElapsedMs_ = millis() - started;
-      if (attempt == MPU_I2C_MAX_ATTEMPTS ||
-          millis() - started >= MPU_I2C_RETRY_BUDGET_MS) break;
-      delay(5);
-    }
-    return false;
+    Wire.beginTransmission(0x68);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
   }
 
   bool readGyroZ(float &rate) {
@@ -194,20 +99,6 @@ class MpuYaw {
   float yaw_ = 0.0f;
   float rate_ = 0.0f;
   bool ready_ = false;
-  bool lastReadOk_ = false;
-  const char *failurePhase_ = "not initialized";
-  const char *failureOperation_ = "none";
-  uint8_t failureRegister_ = 0;
-  int failureDetail_ = 0;
-  int failureAttempts_ = 0;
-  unsigned long failureElapsedMs_ = 0;
-  unsigned long recoveredReads_ = 0;
-  unsigned long selectErrors_ = 0;
-  unsigned long shortReads_ = 0;
-  uint8_t lastSelectStatus_ = 0;
-  uint8_t lastReceivedCount_ = 0;
-  unsigned long lastRecoveryLogMs_ = 0;
-  int worstRecoveryAttempt_ = 0;
   unsigned long lastPollMs_ = 0;
   unsigned long lastGoodMs_ = 0;
 };
@@ -236,10 +127,13 @@ constexpr int LEFT_ENCODER = 33, RIGHT_ENCODER = 35;
 
 constexpr int LEFT_XSHUT = 4, RIGHT_XSHUT = 5, FRONT_XSHUT = 16;
 
-// Five measured one-cell trials (L/R): 597/600, 528/594, 632/638,
-// 614/597, 589/591. The median resists the anomalous 528 left count.
-constexpr float LEFT_TICKS_PER_CELL = 623.0f;
-constexpr float RIGHT_TICKS_PER_CELL = 623.0f;
+// Two hand-pushed trials over 7 cells (1260 mm): L/R
+// 4363/4360, 4265/4283. Both trials were confirmed as 1260 mm.
+constexpr float LEFT_TICKS_PER_CELL =
+    ((4363.0f + 4265.0f) / 2.0f) / 7.0f;
+
+constexpr float RIGHT_TICKS_PER_CELL =
+    ((4360.0f + 4283.0f) / 2.0f) / 7.0f;
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 1;
@@ -254,9 +148,9 @@ constexpr unsigned long RIGHT_TARGET_TICKS =
     (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 623 &&
-    RIGHT_TARGET_TICKS == 623,
-    "Check one-cell targets against the measured trials"
+    LEFT_TARGET_TICKS == 616 &&
+    RIGHT_TARGET_TICKS == 617,
+    "Check one-cell targets from the tested seven-cell calibration"
 );
 
 constexpr int FORWARD_TARGET_MM =
@@ -321,7 +215,7 @@ constexpr SingleWallSettings SINGLE_WALL_SETTINGS = {
     SINGLE_WALL_KP, SINGLE_WALL_KI, SINGLE_WALL_KD, SINGLE_WALL_MAX_PWM
 };
 SingleWallController singleWallPid;
-// Case 3 uses the measured one-cell calibration to compare travelled distance.
+// Case 3 uses the manual 7-cell calibration to compare travelled distance.
 constexpr float NO_WALL_ENCODER_KP = 1.7f;
 constexpr float NO_WALL_ENCODER_KI = 0.10f;
 constexpr float NO_WALL_ENCODER_KD = 0.0f;
@@ -331,8 +225,8 @@ constexpr float NO_WALL_MPU_RATE_KD = 0.5f;
 constexpr float NO_WALL_MPU_MAX_PWM = 25.0f;
 constexpr float NO_WALL_MPU_WEIGHT = 0.80f;
 // Use the same rolling floors in every wall mode; 70/60 still stalled in the demo.
-constexpr int NO_WALL_MIN_BASE_PWM = 120;
-constexpr int NO_WALL_MIN_MOTOR_PWM = 100;
+constexpr int NO_WALL_MIN_BASE_PWM = MIN_APPROACH_PWM;
+constexpr int NO_WALL_MIN_MOTOR_PWM = WALL_SLOW_SPEED;
 constexpr NoWallSettings NO_WALL_SETTINGS = {
     LEFT_TICKS_PER_CELL, RIGHT_TICKS_PER_CELL,
     NO_WALL_MIN_MOTOR_PWM,
@@ -690,16 +584,13 @@ bool initSensors() {
   reportTofStep("LEFT", "init", leftInitStatus);
   reportTofStep("LEFT", "configureDefault", leftConfigStatus);
   reportTofStep("LEFT", "setAddress", leftAddressStatus);
-  if (!leftTimingOk) debugPrintln("TOF ERROR | LEFT timing configuration failed");
   leftReady = reportTofStep("LEFT", "probe 0x30", probeTof(0x30));
   reportTofStep("RIGHT", "init", rightInitStatus);
   reportTofStep("RIGHT", "configureDefault", rightConfigStatus);
   reportTofStep("RIGHT", "setAddress", rightAddressStatus);
-  if (!rightTimingOk) debugPrintln("TOF ERROR | RIGHT timing configuration failed");
   rightReady = reportTofStep("RIGHT", "probe 0x31", probeTof(0x31));
   if (!frontInitOk) debugPrintln("TOF ERROR | front initialization failed");
   if (!frontModeOk) debugPrintln("TOF ERROR | front distance mode failed");
-  if (!frontTimingOk) debugPrintln("TOF ERROR | FRONT timing configuration failed");
   reportTofStep("FRONT", "setAddress", frontAddressStatus);
   reportTofStep("FRONT", "startContinuous", frontStartStatus);
   frontReady = reportTofStep("FRONT", "probe 0x32", probeTof(0x32)) && frontInitOk;
@@ -742,9 +633,7 @@ int readSideForMotion(VL6180X &sensor) {
             tofFailure = &sensor == &leftTof ? "LEFT ready timeout" : "RIGHT ready timeout";
             return -1;
         }
-        // A ToF conversion takes much longer than 1 ms. Leave bus time for
-        // the MPU instead of polling this sensor every millisecond.
-        delay(5);
+        delay(1);
     }
     int mm=sensor.readRangeContinuousMillimeters(); // Already ready; no long wait.
     bool valid=!sensor.timeoutOccurred() && sensor.last_status==0;
@@ -758,35 +647,33 @@ int readSideForMotion(VL6180X &sensor) {
     return rangeStatus==0 ? mm : SIDE_NO_TARGET_MM;
 }
 
-bool observe(int &front,int &left,int &right,int &rightRaw,
-             bool stoppedScan = false, bool frontOnly = false) {
+bool observe(int &front,int &left,int &right,int &rightRaw, bool stoppedScan = false) {
     sideCommunicationFault=false;
     tofFailure = "none";
     tofFailureCode = 0;
     front=left=right=rightRaw=-1;
     tofFrontRaw=tofLeftRaw=tofFrontFiltered=-1;
-    if (!frontOnly) {
-        // Side ranges are unnecessary during a short front-wall adjustment.
-        leftTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
-        if (leftTof.last_status!=0) {
-            sideCommunicationFault=true;
-            tofFailure="LEFT clear I2C"; tofFailureCode=leftTof.last_status;
-        }
-        rightTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
-        if (rightTof.last_status!=0) {
-            sideCommunicationFault=true;
-            tofFailure="RIGHT clear I2C"; tofFailureCode=rightTof.last_status;
-        }
-        leftTof.writeReg(VL6180X::SYSRANGE__START,0x01);
-        if (leftTof.last_status!=0) {
-            sideCommunicationFault=true;
-            tofFailure="LEFT trigger I2C"; tofFailureCode=leftTof.last_status;
-        }
-        rightTof.writeReg(VL6180X::SYSRANGE__START,0x01);
-        if (rightTof.last_status!=0) {
-            sideCommunicationFault=true;
-            tofFailure="RIGHT trigger I2C"; tofFailureCode=rightTof.last_status;
-        }
+    // Clear any unread result from a previously interrupted run, then start
+    // both side shots while the front sensor is also measuring.
+    leftTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
+    if (leftTof.last_status!=0) {
+        sideCommunicationFault=true;
+        tofFailure="LEFT clear I2C"; tofFailureCode=leftTof.last_status;
+    }
+    rightTof.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR,0x01);
+    if (rightTof.last_status!=0) {
+        sideCommunicationFault=true;
+        tofFailure="RIGHT clear I2C"; tofFailureCode=rightTof.last_status;
+    }
+    leftTof.writeReg(VL6180X::SYSRANGE__START,0x01);
+    if (leftTof.last_status!=0) {
+        sideCommunicationFault=true;
+        tofFailure="LEFT trigger I2C"; tofFailureCode=leftTof.last_status;
+    }
+    rightTof.writeReg(VL6180X::SYSRANGE__START,0x01);
+    if (rightTof.last_status!=0) {
+        sideCommunicationFault=true;
+        tofFailure="RIGHT trigger I2C"; tofFailureCode=rightTof.last_status;
     }
     unsigned long began=millis();
     while (true) {
@@ -802,8 +689,7 @@ bool observe(int &front,int &left,int &right,int &rightRaw,
             tofFailure="FRONT ready timeout";
             return false;
         }
-        // Avoid saturating the shared I2C bus while waiting for a new range.
-        delay(5);
+        delay(1);
     }
     front=frontTof.read(false);
     bool frontTimedOut=frontTof.timeoutOccurred();
@@ -826,8 +712,6 @@ bool observe(int &front,int &left,int &right,int &rightRaw,
     tofFrontRaw=front;
     tofFrontFiltered=frontFilter.update(front,frontValid);
     // Brake before side reads or logging when the front sample requires a stop.
-    if (frontValid && !frontOnly && front <= FRONT_PREMATURE_BRAKE_MM)
-        drive(0, 0);
     if (!frontValid || front <= FRONT_EMERGENCY_STOP_MM) {
         drive(0, 0);
         // A stationary junction scan still needs side ranges at a dead end.
@@ -837,7 +721,6 @@ bool observe(int &front,int &left,int &right,int &rightRaw,
             return frontValid;
         }
     }
-    if (frontOnly) return frontValid;
     tofLeftRaw=readSideForMotion(leftTof);
     // A newly distant reading must release the wall immediately, even if the
     // median still contains two old close readings. Distances are chassis-based.
@@ -855,7 +738,7 @@ bool observe(int &front,int &left,int &right,int &rightRaw,
 // ============================================================
 
 void reportMovementConfig() {
-    debugPrintln("MOTION BUILD | encoder-median-v13 | " __DATE__ " " __TIME__);
+    debugPrintln("MOTION BUILD | wall-reference-60mm-v9 | " __DATE__ " " __TIME__);
     char line[180];
     snprintf(line, sizeof(line),
         "MOVE CONFIG | cell=%dmm | cruise=%d | base/motor floor=%d/%d | front target=%dmm +/-%.1f%% | trigger=%dmm | yaw: +right/-left",
@@ -864,19 +747,10 @@ void reportMovementConfig() {
         FRONT_WALL_STOP_TRIGGER_MM);
     debugPrintln(line);
     snprintf(line, sizeof(line),
-        "ENCODER CAL | ticks/cell L/R=%.0f/%.0f | five one-cell trials, median",
-        LEFT_TICKS_PER_CELL, RIGHT_TICKS_PER_CELL);
-    debugPrintln(line);
-    snprintf(line, sizeof(line),
         "NO WALL | MPU Kp/Kd=%.2f/%.2f max=%.0f weight=%.0f%% | encoder Kp/Ki=%.2f/%.2f max=%.0f",
         NO_WALL_MPU_HEADING_KP, NO_WALL_MPU_RATE_KD, NO_WALL_MPU_MAX_PWM,
         NO_WALL_MPU_WEIGHT*100.0f, NO_WALL_ENCODER_KP, NO_WALL_ENCODER_KI,
         NO_WALL_ENCODER_MAX_PWM);
-    debugPrintln(line);
-    snprintf(line, sizeof(line),
-        "NO WALL SPEED | front>%dmm base/motor floor=%d/%d | near front base=%d",
-        FRONT_MAP_OPEN_MM, NO_WALL_MIN_BASE_PWM, NO_WALL_MIN_MOTOR_PWM,
-        MIN_APPROACH_PWM);
     debugPrintln(line);
     snprintf(line, sizeof(line),
         "WALL PID | single Kp/Ki/Kd=%.2f/%.2f/%.2f | two Kp/Ki/Kd=%.2f/%.2f/%.2f",
@@ -885,29 +759,11 @@ void reportMovementConfig() {
     debugPrintln(line);
 }
 
-DemoMoveResult runForwardDistance(int cells) {
+DemoMoveResult runForwardDistance() {
     if (!sensorsReady) {
         debugPrintln("REFUSED: ToF initialization failed.");
         return DemoMoveResult::Failed;
     }
-    // Zero cells is a short wall-reference adjustment after an encoder move.
-    if (cells < 0 || cells > 3) return DemoMoveResult::Failed;
-
-    const unsigned long leftTarget = LEFT_TARGET_TICKS * cells;
-    const unsigned long rightTarget = RIGHT_TARGET_TICKS * cells;
-    // The front ToF decides when the final cell ends. Encoders only confirm
-    // that earlier cells in a continuous run have been passed.
-    const float minimumFrontWallTravelMm = cells <= 1 ? 0.0f :
-        (cells - 1) * CELL_LENGTH_MM;
-    char startLine[100];
-    if (cells == 0)
-        snprintf(startLine, sizeof(startLine),
-                 "WALL REFERENCE START | front target=%dmm | max extra=%.0fmm",
-                 FRONT_WALL_TARGET_MM, FRONT_APPROACH_MAX_EXTRA_MM);
-    else
-        snprintf(startLine, sizeof(startLine), "MOVE START | cells=%d | target=%dmm%s",
-                 cells, cells * CELL_LENGTH_MM, cells > 1 ? " | continuous" : "");
-    debugPrintln(startLine);
 
     unsigned long startLeft, startRight;
     readTicks(startLeft, startRight);
@@ -916,8 +772,8 @@ DemoMoveResult runForwardDistance(int cells) {
     unsigned long previousLeft = 0, previousRight = 0, lastLog = started;
     const char *result = "TIMEOUT";
     DemoMoveResult outcome = DemoMoveResult::Failed;
-    bool approachingFrontWall = cells == 0;
-    unsigned long frontApproachStarted = started, approachLeft = 0, approachRight = 0;
+    bool approachingFrontWall = false;
+    unsigned long frontApproachStarted = 0, approachLeft = 0, approachRight = 0;
     int lastFrontMm = -1;
     unsigned long previousControlMs = started;
     approachPid.reset();
@@ -943,8 +799,8 @@ DemoMoveResult runForwardDistance(int cells) {
         // Brake at the nominal endpoint while getting a fresh front reading.
         // An open path finishes here; a nearby wall may need extra approach.
         if (!approachingFrontWall &&
-            cellEncoderLimitReached(left, right, leftTarget - BRAKE_LEAD_TICKS,
-                                    rightTarget - BRAKE_LEAD_TICKS)) {
+            cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
+                                    RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
             drive(0, 0);
         }
         if (now - started >= MOVE_TIMEOUT_MS) break;
@@ -955,8 +811,7 @@ DemoMoveResult runForwardDistance(int cells) {
         }
 
         int front = -1, sideLeft = -1, sideRight = -1, sideRightRaw = -1;
-        bool frontValid = observe(front, sideLeft, sideRight, sideRightRaw,
-                                  false, cells == 0);
+        bool frontValid = observe(front, sideLeft, sideRight, sideRightRaw);
         // Stop wins over a sensor fault received during a blocking read.
         handleWiFiClient();
         if (motionStopRequested || readCommand() == MovementCommand::Stop) {
@@ -966,81 +821,34 @@ DemoMoveResult runForwardDistance(int cells) {
         }
         if (!frontValid) {
             result = "INVALID FRONT TOF READING";
-            char line[125];
-            snprintf(line, sizeof(line), "MOVE SENSOR FAULT | %s | code=%d",
-                     tofFailure, tofFailureCode);
-            debugPrintln(line);
             break;
         }
         lastFrontMm = front;
-        // ToF reads block; use encoder counts from the same instant as the
-        // front-wall decision rather than counts taken before the read.
-        readTicks(rawLeft, rawRight);
-        left = rawLeft - startLeft;
-        right = rawRight - startRight;
-        const float leftTravelMm = left * CELL_LENGTH_MM / LEFT_TICKS_PER_CELL;
-        const float rightTravelMm = right * CELL_LENGTH_MM / RIGHT_TICKS_PER_CELL;
-        const bool cellTravelled = cellTravelMeetsMinimum(
-            leftTravelMm, rightTravelMm, minimumFrontWallTravelMm);
-        if (cells != 0 && front <= FRONT_PREMATURE_BRAKE_MM && !cellTravelled) {
-            drive(0, 0);
-            result = "EARLY FRONT WALL: CELL NOT REACHED";
-            break;
-        }
+        if (sideCommunicationFault) { result="SIDE TOF COMMUNICATION FAILURE"; break; }
         if (front <= FRONT_EMERGENCY_STOP_MM) {
-            if (cellTravelled) {
-                result = "FRONT WALL BRAKE TRIGGERED";
-                outcome = DemoMoveResult::FrontWallReached;
-            } else {
-                result = "FRONT WALL TOO EARLY: PLANNED CELLS NOT REACHED";
-            }
-            break;
-        }
-        if (cells != 0 && front <= FRONT_MAP_OPEN_MM &&
-            fabsf(mpuYaw.yaw() * MPU_YAW_SIGN) >= FRONT_SKEW_BRAKE_DEG) {
-            drive(0, 0);
-            result = "FRONT WALL NEAR WITH LARGE YAW; ALIGN BEFORE APPROACH";
-            if (cellTravelled) outcome = DemoMoveResult::FrontWallReached;
-            break;
-        }
-        if (cells == 0 && front > FRONT_MAP_OPEN_MM) {
-            result = "FRONT WALL LOST DURING REFERENCE";
-            break;
-        }
-        if (sideCommunicationFault && cells != 0) {
-            result="SIDE TOF COMMUNICATION FAILURE";
-            drive(0, 0);
-            char line[125];
-            snprintf(line, sizeof(line), "MOVE SENSOR FAULT | %s | code=%d",
-                     tofFailure, tofFailureCode);
-            debugPrintln(line);
-            break;
-        }
-        if (cells != 0 && !mpuYaw.healthy()) {
-            result = "MPU UNAVAILABLE OR STALE";
-            drive(0, 0);
-            if (!mpuYaw.lastReadOk()) mpuYaw.logFault("forward movement stopped");
-            else {
-                char line[100];
-                snprintf(line, sizeof(line),
-                         "MPU FAULT | forward gyro sample stale | last good=%lums ago",
-                         mpuYaw.lastGoodAgeMs());
-                debugPrintln(line);
-            }
+            result = "FRONT WALL REACHED: 60 MM REFERENCE TRIGGERED";
+            outcome = DemoMoveResult::FrontWallReached;
             break;
         }
         WallMode mode=wallDetector.update(sideLeft,sideRight);
-        if (cells != 0 && mode==WallMode::None && (sideLeft<0 || sideRight<0)) {
+        if (mode==WallMode::None && (sideLeft<0 || sideRight<0)) {
             result="CASE 3 REQUIRES TWO VALID SIDE READINGS"; break;
         }
         const bool oneWallMode=mode==WallMode::LeftOnly || mode==WallMode::RightOnly;
-        if (cells != 0 && oneWallMode && MPU_YAW_SIGN==0) {
+        if (oneWallMode && MPU_YAW_SIGN==0) {
             result="SET MPU_YAW_SIGN BEFORE CASE 2"; break;
         }
+        if (oneWallMode && !mpuYaw.healthy()) {
+            result="MPU UNAVAILABLE OR STALE: CASE 2 STOPPED"; break;
+        }
 
+        // Sensor calls can take time: check distance again before applying PWM.
+        readTicks(rawLeft, rawRight);
+        left = rawLeft - startLeft;
+        right = rawRight - startRight;
         if (!approachingFrontWall &&
-            cellEncoderLimitReached(left, right, leftTarget - BRAKE_LEAD_TICKS,
-                                    rightTarget - BRAKE_LEAD_TICKS)) {
+            cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
+                                    RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
             if (front > FRONT_OPEN_MM) {
                 result = "RUN ENCODER LIMIT REACHED";
                 outcome = DemoMoveResult::EncoderReached;
@@ -1064,8 +872,8 @@ DemoMoveResult runForwardDistance(int cells) {
                 break;
             }
         }
-        unsigned long leftRemaining = ticksBeforeBrake(left, leftTarget, BRAKE_LEAD_TICKS);
-        unsigned long rightRemaining = ticksBeforeBrake(right, rightTarget, BRAKE_LEAD_TICKS);
+        unsigned long leftRemaining = ticksBeforeBrake(left, LEFT_TARGET_TICKS, BRAKE_LEAD_TICKS);
+        unsigned long rightRemaining = ticksBeforeBrake(right, RIGHT_TARGET_TICKS, BRAKE_LEAD_TICKS);
         unsigned long remaining = leftRemaining < rightRemaining ? leftRemaining : rightRemaining;
         unsigned long controlMs = millis();
         float dt = (controlMs - previousControlMs) / 1000.0f;
@@ -1078,9 +886,7 @@ DemoMoveResult runForwardDistance(int cells) {
         float encoderError=0, encoderPwm=0;
         const float yawRight=mpuYaw.yaw()*MPU_YAW_SIGN;
         const float rateRight=mpuYaw.rate()*MPU_YAW_SIGN;
-        if (cells == 0) {
-            commands = {MIN_APPROACH_PWM, MIN_APPROACH_PWM};
-        } else if (mode==WallMode::Two) {
+        if (mode==WallMode::Two) {
             singleWallPid.reset();
             noWallPid.reset();
             commands=twoWallPid.update(sideLeft,sideRight,approachSpeed,
@@ -1093,9 +899,7 @@ DemoMoveResult runForwardDistance(int cells) {
         } else {
             twoWallPid.reset();
             singleWallPid.reset();
-            const int baseFloor = front > FRONT_MAP_OPEN_MM
-                ? NO_WALL_MIN_BASE_PWM : MIN_APPROACH_PWM;
-            approachSpeed=noWallApproachSpeed(approachSpeed,baseFloor,FORWARD_SPEED);
+            approachSpeed=noWallApproachSpeed(approachSpeed,NO_WALL_MIN_BASE_PWM,FORWARD_SPEED);
             commands=noWallPid.update(left,right,approachSpeed,
                 NO_WALL_SETTINGS,dt,encoderError,encoderPwm);
             const bool noWallMpuReady=mpuYaw.healthy();
@@ -1115,7 +919,6 @@ DemoMoveResult runForwardDistance(int cells) {
             char telemetry[280];
             snprintf(telemetry, sizeof(telemetry),
                 "MOVE | %s | mm F/L/R=%d/%d/%d | travel L/R=%.1f/%.1fmm | yaw=%+.2fdeg | PWM L/R=%d/%d | correction wall/mpu/enc=%.1f/%.1f/%.1f",
-                cells == 0 ? "front reference" :
                 mode==WallMode::Two ? "2 walls" :
                     (mode==WallMode::LeftOnly ? "left wall" :
                     (mode==WallMode::RightOnly ? "right wall" : "no walls")),
@@ -1136,9 +939,6 @@ DemoMoveResult runForwardDistance(int cells) {
     singleWallPid.reset();
     noWallPid.reset();
     waitWithMotionService(100); // Sample yaw and residual movement after braking.
-    int stoppedFront = -1, unusedLeft, unusedRight, unusedRightRaw;
-    if (!observe(stoppedFront, unusedLeft, unusedRight, unusedRightRaw,
-                 true, true)) stoppedFront = -1;
     unsigned long endLeft, endRight;
     readTicks(endLeft, endRight);
     char summary[240];
@@ -1150,14 +950,13 @@ DemoMoveResult runForwardDistance(int cells) {
         mpuYaw.yaw() * MPU_YAW_SIGN, millis() - started);
     debugPrintln(summary);
     if (outcome == DemoMoveResult::FrontWallReached) {
-        const bool readingInBand = stoppedFront >= 0 &&
-            fabsf(stoppedFront - FRONT_WALL_TARGET_MM) <= FRONT_WALL_TOLERANCE_MM;
+        const bool readingInBand = lastFrontMm >= FRONT_WALL_MIN_IN_BAND_MM &&
+                                   lastFrontMm <= FRONT_WALL_STOP_TRIGGER_MM;
         snprintf(summary,sizeof(summary),
-                 "WALL REFERENCE | target=%dmm +/-%.1f%% | trigger=%dmm | front at brake/stopped=%d/%dmm | %s",
+                 "WALL REFERENCE | target=%dmm +/-%.1f%% | trigger=%dmm | front at brake=%dmm | %s",
                  FRONT_WALL_TARGET_MM,FRONT_WALL_TOLERANCE_PERCENT,
-                 FRONT_WALL_STOP_TRIGGER_MM,lastFrontMm,stoppedFront,
-                 readingInBand ? "IN BAND" :
-                     (stoppedFront < FRONT_WALL_TARGET_MM ? "BELOW TARGET" : "ABOVE TARGET"));
+                 FRONT_WALL_STOP_TRIGGER_MM,lastFrontMm,
+                 readingInBand ? "IN BAND" : "BELOW BAND");
         debugPrintln(summary);
     }
     return motionStopRequested ? DemoMoveResult::Stopped : outcome;
@@ -1169,8 +968,8 @@ void runMove() {
     motionStopRequested=false;
     mpuYaw.reset();
     wallDetector.reset();
-    debugPrintln("Moving one cell (180 mm); front wall target 60 mm +/-1%.");
-    DemoMoveResult outcome = runForwardDistance(1);
+    debugPrintln("Moving one cell (180 mm); front wall target 60 mm +/-3%.");
+    DemoMoveResult outcome = runForwardDistance();
     if (outcome == DemoMoveResult::Stopped || outcome == DemoMoveResult::Failed) {
         debugPrintln("Run stopped; send s when ready for a new run.");
         return;
@@ -1266,9 +1065,8 @@ void moveForwardSetup() {
     sensorsReady =
         initSensors();
     debugPrintln("MPU6050 calibration: keep the robot completely still.");
-    const bool mpuReady = mpuYaw.begin();
-    if (!mpuReady) mpuYaw.logFault("initialization after I2C retries");
-    debugPrintln(mpuReady?"MPU6050 ready (direct yaw, no software Kalman filter).":"MPU initialization FAILED; forward movement unavailable.");
+    bool mpuReady=mpuYaw.begin();
+    debugPrintln(mpuReady?"MPU6050 ready (direct yaw, no software Kalman filter).":"MPU failed: only two-wall mode available.");
     if (MPU_YAW_SIGN==0) debugPrintln("Case 2 needs MPU_YAW_SIGN: +1 for right-positive yaw, -1 for right-negative yaw.");
 
     digitalWrite(
@@ -1337,23 +1135,8 @@ void moveForwardStop() {
 
 // Demo adapter: both controllers share this transport and run sequentially.
 bool demoMotionReady() {
-    if (!sensorsReady) {
-        debugPrintln("READY FAULT | ToF initialization failed; see TOF ERROR lines");
-        return false;
-    }
     mpuYaw.service();
-    if (mpuYaw.healthy()) return true;
-    if (!mpuYaw.initialized()) {
-        mpuYaw.logFault("forward MPU not initialized");
-    } else {
-        char line[115];
-        snprintf(line, sizeof(line),
-                 "READY FAULT | sensor=forward MPU6050 0x68 | last read ok=%d | last good=%lums ago",
-                 mpuYaw.lastReadOk(), mpuYaw.lastGoodAgeMs());
-        debugPrintln(line);
-        if (!mpuYaw.lastReadOk()) mpuYaw.logFault("latest gyro read failed");
-    }
-    return false;
+    return sensorsReady && mpuYaw.healthy();
 }
 
 MovementCommand demoReadCommand() {
@@ -1403,78 +1186,20 @@ bool demoReadPaths(int &front, int &left, int &right) {
 }
 
 DemoMoveResult demoMoveOneCell() {
-    return demoMoveStraightCells(1);
-}
-
-DemoMoveResult demoMoveStraightCells(int cells) {
     if (motionStopRequested) return DemoMoveResult::Stopped;
     if (!demoMotionReady()) return DemoMoveResult::Failed;
     frontFilter.reset(); leftFilter.reset(); rightFilter.reset();
     wallDetector.reset();
     // Capture a new heading after every turn, before the next forward move.
     mpuYaw.reset();
-    return runForwardDistance(cells);
-}
-
-bool readFrontForReference(int &front) {
-    drive(0, 0);
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        handleWiFiClient();
-        int left, right, rightRaw;
-        if (observe(front, left, right, rightRaw, true, true)) return true;
-        if (motionStopRequested) return false;
-        if (attempt < 2) waitWithMotionService(50);
-    }
-    char line[110];
-    snprintf(line, sizeof(line), "WALL REFERENCE SCAN ERROR | %s | code=%d",
-             tofFailure, tofFailureCode);
-    debugPrintln(line);
-    return false;
-}
-
-DemoMoveResult demoReachFrontWallReference() {
-    if (motionStopRequested) return DemoMoveResult::Stopped;
-    int front;
-    if (!readFrontForReference(front))
-        return motionStopRequested ? DemoMoveResult::Stopped : DemoMoveResult::Failed;
-    if (front > FRONT_MAP_OPEN_MM) return DemoMoveResult::EncoderReached;
-    if (front <= FRONT_WALL_STOP_TRIGGER_MM) {
-        char line[90];
-        snprintf(line, sizeof(line), "WALL REFERENCE | already at/below trigger | front=%dmm", front);
-        debugPrintln(line);
-        return DemoMoveResult::FrontWallReached;
-    }
-    // Confirm a nearby wall after the chassis and heading have settled.
-    if (!readFrontForReference(front))
-        return motionStopRequested ? DemoMoveResult::Stopped : DemoMoveResult::Failed;
-    if (front > FRONT_MAP_OPEN_MM) return DemoMoveResult::EncoderReached;
-    if (front <= FRONT_WALL_STOP_TRIGGER_MM) return DemoMoveResult::FrontWallReached;
-    mpuYaw.reset();
-    return runForwardDistance(0);
+    return runForwardDistance();
 }
 
 bool demoHeadingError(float &yawRightDegrees) {
     mpuYaw.service();
-    if (mpuYaw.healthy()) {
-        yawRightDegrees = mpuYaw.yaw() * MPU_YAW_SIGN;
-        return isfinite(yawRightDegrees);
-    }
-    debugPrintln("ALIGN | MPU unavailable after I2C retries");
-    if (!mpuYaw.lastReadOk()) mpuYaw.logFault("arrival alignment");
-    else {
-        char line[90];
-        snprintf(line, sizeof(line), "MPU FAULT | alignment sample stale | last good=%lums ago",
-                 mpuYaw.lastGoodAgeMs());
-        debugPrintln(line);
-    }
-    return false;
-}
-
-bool demoResetYaw() {
-    if (!demoMotionReady()) return false;
-    mpuYaw.reset();
-    debugPrintln("MPU RESET | forward relative yaw=0deg");
-    return true;
+    if (!mpuYaw.healthy()) return false;
+    yawRightDegrees = mpuYaw.yaw() * MPU_YAW_SIGN;
+    return isfinite(yawRightDegrees);
 }
 
 void demoLog(const char *text) { debugPrintln(text); }
