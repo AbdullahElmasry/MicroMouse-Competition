@@ -49,7 +49,7 @@ template<class T> void debugPrint(const T&, int) {}
 template<class T> void debugPrintln(const T&) {}
 void debugPrintln() {}
 void reportMovementConfig() {}
-void handleBluetoothClient() {}
+void handleWiFiClient() {}
 void serviceMotionSensors() {}
 void waitWithMotionService(unsigned long ms) { delay(ms); }
 void readTicks(unsigned long &left, unsigned long &right) { left=leftTicks; right=rightTicks; }

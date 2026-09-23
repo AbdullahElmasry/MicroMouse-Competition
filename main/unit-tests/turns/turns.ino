@@ -32,6 +32,7 @@ void logPrintln(const String &text = "") {
 
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
   logPrint("Connecting to WiFi: ");
   logPrintln(WIFI_SSID);
@@ -166,9 +167,9 @@ void loop() {
   int input = readCommand();
 
   if (input == 'l' || input == 'L') {
-    turnDegrees(-90);
-  } else if (input == 'r' || input == 'R') {
     turnDegrees(90);
+  } else if (input == 'r' || input == 'R') {
+    turnDegrees(-90);
   } else if (input == 'd' || input == 'D' ||
              input == 'x' || input == 'X') {
     stopRotation();

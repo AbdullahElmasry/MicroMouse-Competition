@@ -102,6 +102,7 @@ inline FakeWire Wire;
 #pragma once
 #include "Arduino.h"
 constexpr int WIFI_STA = 1, WL_CONNECTED = 3;
+constexpr int WIFI_POWER_8_5dBm = 34;
 struct WiFiClient {
   bool active = false;
   explicit operator bool() const { return active; }
@@ -122,6 +123,7 @@ struct WiFiServer {
 struct FakeIP { String toString() { return "127.0.0.1"; } };
 struct FakeWiFi {
   void mode(int) {}
+  void setTxPower(int power) { assert(power == WIFI_POWER_8_5dBm); }
   void begin(const char *, const char *) {}
   int status() { return WL_CONNECTED; }
   FakeIP localIP() { return {}; }
@@ -156,11 +158,11 @@ int main() {
     usbInput.push_back(command);
     loop();
     bool right = command == 'r' || command == 'R';
-    assert(firstLeft == (right ? 25 : 26));
-    assert(firstRight == (right ? 27 : 14));
-    assert(std::fabs(physicalAngle - (right ? 90 : -90)) <= 1.5f);
+    assert(firstLeft == (right ? 26 : 25));
+    assert(firstRight == (right ? 14 : 27));
+    assert(std::fabs(physicalAngle - (right ? -90 : 90)) <= 1.5f);
     assert(logs.find("Turn done.") != std::string::npos);
-    assert(maxPwm == 150 && minPwm == 85);
+    assert(maxPwm == 150 && minPwm == 95);
     assertStopped();
   }
   reset();

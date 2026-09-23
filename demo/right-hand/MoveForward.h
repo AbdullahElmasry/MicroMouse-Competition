@@ -13,6 +13,16 @@ inline int sideClearanceMm(int rangeMm, int insetMm) {
   return rangeMm > insetMm ? rangeMm - insetMm : 0;
 }
 
+// Pololu VL53L1X range status values used by the front sensor.
+// SignalFail (2) and OutOfBoundsFail (4) mean that no target was measured.
+inline bool frontRangeStatusMeansOpen(uint8_t status) {
+  return status == 2 || status == 4;
+}
+
+inline bool frontRangeStatusIsUsable(uint8_t status) {
+  return status == 0 || status == 6 || frontRangeStatusMeansOpen(status);
+}
+
 struct ForwardWallSettings {
   int baseSpeed;
   int slowSpeed;

@@ -4,21 +4,20 @@ The right sensor is recessed 10 mm. The forward sketch subtracts RIGHT_TOF_INSET
 
 # Seven-cell forward test: two-wall and one-wall guidance
 
-The forward implementation is packaged as `MoveForward.h` and `MoveForward.cpp`. The header contains the reusable controller types and the module entry points; the implementation owns the ESP32, motor, encoder, ToF, MPU6050, Bluetooth Serial, command, and telemetry details. `moving_forward.ino` is only a thin Arduino adapter that calls `moveForwardSetup()` and `moveForwardLoop()`. Copy those three files into another Arduino sketch folder to reuse the module; call `moveForwardStop()` when an external component must stop it.
+The forward implementation is packaged as `MoveForward.h` and `MoveForward.cpp`. The header contains the reusable controller types and the module entry points; the implementation owns the ESP32, motor, encoder, ToF, MPU6050, WiFi, command, and telemetry details. `moving_forward.ino` is only a thin Arduino adapter that calls `moveForwardSetup()` and `moveForwardLoop()`. Copy those three files into another Arduino sketch folder to reuse the module; call `moveForwardStop()` when an external component must stop it.
 
-Send `start` over Bluetooth Serial or USB Serial at 115200 baud. The robot moves seven 180 mm cells, continuously, with no intermediate cell stops. After cell seven it stays stopped. Send `d` during movement to cancel the remaining run. A new start begins a new seven-cell sequence, not the remainder of an interrupted run. No automatic startup movement occurs. Blocking sensor reads and Bluetooth writes can delay command handling.
+Send `start` over WiFi TCP port 23 or USB Serial at 115200 baud. The robot moves seven 180 mm cells, continuously, with no intermediate cell stops. After cell seven it stays stopped. Send `d` during movement to cancel the remaining run. A new start begins a new seven-cell sequence, not the remainder of an interrupted run. No automatic startup movement occurs. Blocking sensor reads and WiFi writes can delay command handling.
 
-## Bluetooth connection
+## WiFi connection
 
-The ESP32 advertises a Bluetooth Classic Serial Port Profile device named `MicroMouse`.
+The ESP32 connects to the WiFi network configured by `WIFI_SSID` and `WIFI_PASSWORD`. Its transmit power is limited with `WiFi.setTxPower(WIFI_POWER_8_5dBm)` to reduce radio power consumption.
 
 1. Upload the sketch and reset the ESP32.
-2. Check USB Serial for `Bluetooth Serial ready. Device name: MicroMouse`.
-3. On an Android phone or computer, pair with `MicroMouse` in Bluetooth settings.
-4. Open a Bluetooth serial terminal and connect to `MicroMouse`.
-5. Send `s` or `start` to begin the seven-cell run. Send `d` at any time to stop.
+2. Open USB Serial at 115200 baud and note the printed ESP32 IP address.
+3. Connect a TCP terminal to that IP address on port 23.
+4. Send `s` or `start` to begin the seven-cell run. Send `d` at any time to stop.
 
-The terminal should receive `ESP32 Micromouse connected by Bluetooth` followed by the same telemetry previously sent over Wi-Fi. Bluetooth Serial uses Classic SPP and requires an original ESP32 with Classic Bluetooth support; ESP32-S2, ESP32-C3, and ESP32-S3 targets cannot build this transport. Generic Bluetooth SPP terminal apps are commonly available on Android and desktop systems. USB Serial remains usable if Bluetooth initialization or connection fails.
+The TCP terminal receives movement telemetry and MPU yaw readings. USB Serial remains usable if WiFi initialization or connection fails.
 
 ## Why the controller changed
 
@@ -122,6 +121,6 @@ Host checks:
 - `tests/forward_wall_control_test.cpp`: recorded sensor examples, threshold boundaries, left-first priority, invalid-side handling, and joint encoder braking.
 - `tests/check_movement_sequence.ps1`: extracts the actual movement functions and runs them with fake time, sensors, and motors; checks continuous seven-cell travel without intermediate stops, joint braking, front readings of 39/40/41 mm, obstacle detection during motion, d during motion, and cancellation after sensor faults.
 - `tests/no_wall_test.cpp`: checks case 3 reference capture, the manual left/right calibration, both steering directions, integral correction, and anti-windup.
-- `tests/movement_commands_test.cpp`: USB/Bluetooth command parsing.
+- `tests/movement_commands_test.cpp`: USB/WiFi command parsing.
 
 These checks passed with g++ using C++11 and warnings as errors. They do not simulate mechanical dynamics. ESP32 compilation and physical verification remain pending.
