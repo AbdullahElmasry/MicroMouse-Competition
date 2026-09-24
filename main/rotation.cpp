@@ -20,11 +20,11 @@ constexpr float turnKp = 15.9f;
 constexpr float turnKi = 0.0f;
 constexpr float turnKd = 1.3f;
 // Keep enough torque to overcome drivetrain stiction near the target.
-constexpr int minOutput = 95;
-constexpr int maxTurnSpeed = 150;
+constexpr int minOutput = 130;
+constexpr int maxTurnSpeed = 180;
 constexpr float angleToleranceDeg = 1.5f;
 constexpr int stableTicksNeeded = 10;
-constexpr unsigned long turnTimeoutMs = 3000;
+constexpr unsigned long turnTimeoutMs = 2200;
 
 float gyroZBias = 0.0f;
 float headingDeg = 0;

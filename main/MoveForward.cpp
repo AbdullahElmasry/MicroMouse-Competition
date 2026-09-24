@@ -183,11 +183,12 @@ constexpr int LEFT_ENCODER = 33, RIGHT_ENCODER = 35;
 constexpr int LEFT_XSHUT = 4, RIGHT_XSHUT = 5, FRONT_XSHUT = 16;
 
 // Tuned encoder target for one 180 mm cell.
-constexpr float LEFT_TICKS_PER_CELL = 620.0f;
-constexpr float RIGHT_TICKS_PER_CELL = 620.0f;
+constexpr float LEFT_TICKS_PER_CELL = 628.0f;
+constexpr float RIGHT_TICKS_PER_CELL = 628.0f;
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 1;
+constexpr int MAX_STRAIGHT_CELLS = 16;
 constexpr int FRONT_EMERGENCY_STOP_MM = FRONT_WALL_STOP_TRIGGER_MM;
 static_assert(FRONT_WALL_STOP_TRIGGER_MM >= FRONT_WALL_TARGET_MM,
               "Front stop trigger must approach the target from above");
@@ -199,15 +200,16 @@ constexpr unsigned long RIGHT_TARGET_TICKS =
     (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 620 &&
-    RIGHT_TARGET_TICKS == 620,
+    LEFT_TARGET_TICKS == 628 &&
+    RIGHT_TARGET_TICKS == 628,
     "Check one-cell targets against the tuned encoder calibration"
 );
 
 constexpr int FORWARD_TARGET_MM =
     CELL_LENGTH_MM * FORWARD_CELLS;
 
-constexpr int FORWARD_SPEED = 140;         //////////// speeeed
+constexpr int FORWARD_SPEED = 150;         //////////// speeeed
+constexpr int SPEED_RUN_CRUISE_PWM = 190;
 
 constexpr unsigned long MOVE_TIMEOUT_MS =
     105000UL; // Whole seven-cell run; stall timeout remains 1500 ms.
@@ -255,7 +257,7 @@ CellApproachController approachPid(APPROACH_SETTINGS);
 // corrected by slowing the left wheel. Reverse it so yaw and encoder steering
 // request the same correction.
 constexpr float MPU_YAW_SIGN = -1.0f;
-constexpr float SINGLE_WALL_KP = 6.0f;
+constexpr float SINGLE_WALL_KP = 13.0f;
 constexpr float SINGLE_WALL_KI = 0.0f;
 constexpr float SINGLE_WALL_KD = 2.5f;
 constexpr float SINGLE_WALL_MAX_PWM = 40.0f;
@@ -760,20 +762,20 @@ bool observe(int &front,int &left,int &right,int &rightRaw, bool stoppedScan = f
         }
     }
     tofFrontRaw=front;
-    tofFrontFiltered=frontFilter.update(front,frontValid);
+    tofFrontFiltered=frontFilter.update(front,frontValid && !frontNoTarget);
     // Brake before side reads or logging when the front sample requires a stop.
-    if (!frontValid || front <= FRONT_EMERGENCY_STOP_MM) {
+    if (!frontValid || front <= FRONT_OPEN_MM) {
         drive(0, 0);
         // A stationary junction scan still needs side ranges at a dead end.
         // Forward motion retains the tested immediate-return brake behavior.
-        if (!frontValid || !stoppedScan) {
+        if (!frontValid || (!stoppedScan && front <= FRONT_EMERGENCY_STOP_MM)) {
             left=right=rightRaw=-1;
             return frontValid;
         }
     }
     tofLeftRaw=readSideForMotion(leftTof);
-    // A newly distant reading must release the wall immediately, even if the
-    // median still contains two old close readings. Distances are chassis-based.
+    // A newly distant reading must release the wall immediately. Distances are
+    // chassis-based; only usable nearby readings enter the five-sample average.
     left=leftFilter.update(tofLeftRaw,tofLeftRaw>=0 &&
         tofLeftRaw<WallModeDetector::RETAIN_MM);
     rightRaw=readSideForMotion(rightTof);
@@ -788,7 +790,7 @@ bool observe(int &front,int &left,int &right,int &rightRaw, bool stoppedScan = f
 // ============================================================
 
 void reportMovementConfig() {
-    debugPrintln("MOTION BUILD | wall-reference-60mm-v9 | " __DATE__ " " __TIME__);
+    debugPrintln("MOTION BUILD | wall-reference-average5-v10 | " __DATE__ " " __TIME__);
     char line[180];
     snprintf(line, sizeof(line),
         "MOVE CONFIG | cell=%dmm | cruise=%d | base/motor floor=%d/%d | front target=%dmm +/-%.1f%% | trigger=%dmm | yaw: +right/-left",
@@ -796,6 +798,7 @@ void reportMovementConfig() {
         FRONT_WALL_TARGET_MM, FRONT_WALL_TOLERANCE_PERCENT,
         FRONT_WALL_STOP_TRIGGER_MM);
     debugPrintln(line);
+    debugPrintln("TOF FILTER | 5-reading average on scans and moving ranges; front emergency brake uses raw reading");
     snprintf(line, sizeof(line),
         "NO WALL | MPU Kp/Kd=%.2f/%.2f max=%.0f weight=%.0f%% | encoder Kp/Ki/Kd=%.2f/%.2f/%.2f max=%.0f",
         NO_WALL_MPU_HEADING_KP, NO_WALL_MPU_RATE_KD, NO_WALL_MPU_MAX_PWM,
@@ -813,11 +816,112 @@ void reportMovementConfig() {
     debugPrintln(line);
 }
 
-DemoMoveResult runForwardDistance() {
+bool readFreshFront(int &front) {
+    const unsigned long started=millis();
+    while (millis()-started<250) {
+        handleWiFiClient();
+        serviceMotionSensors();
+        if (motionStopRequested) return false;
+        if (demoReadFrontDistance(front)) return true;
+        delay(2);
+    }
+    return false;
+}
+
+bool readFrontAverage(int &front) {
+    int sum = 0;
+    for (int sample = 0; sample < 5; ++sample) {
+        int reading;
+        if (!readFreshFront(reading)) return false;
+        sum += reading;
+    }
+    front = (sum + 2) / 5;
+    return true;
+}
+
+bool settleAtFrontWall(int &front, const char *&failure) {
+    unsigned long leftStart,rightStart;
+    readTicks(leftStart,rightStart);
+    unsigned long previousLeft=leftStart,previousRight=rightStart;
+    unsigned long lastLeftMovement=millis(),lastRightMovement=millis();
+    const unsigned long started=millis();
+    unsigned long lastLog=started;
+    float checkpointTravel=0;
+    int checkpointFront=front;
+    while (front>FRONT_WALL_STOP_TRIGGER_MM) {
+        if (motionStopRequested) { failure="stopped"; return false; }
+        if (front>FRONT_WALL_TARGET_MM+FRONT_APPROACH_MAX_EXTRA_MM) {
+            failure="front target lost"; return false;
+        }
+        if (millis()-started>=FRONT_APPROACH_TIMEOUT_MS) {
+            failure="timeout"; return false;
+        }
+        unsigned long left,right;
+        readTicks(left,right);
+        const float extraLeft=(left-leftStart)*CELL_LENGTH_MM/LEFT_TICKS_PER_CELL;
+        const float extraRight=(right-rightStart)*CELL_LENGTH_MM/RIGHT_TICKS_PER_CELL;
+        if (extraLeft>=FRONT_APPROACH_MAX_EXTRA_MM ||
+            extraRight>=FRONT_APPROACH_MAX_EXTRA_MM) {
+            failure="extra travel limit"; return false;
+        }
+        if (fabsf(extraLeft-extraRight)>8) {
+            failure="wheel travel mismatch"; return false;
+        }
+        if (millis()-lastLeftMovement>=500 ||
+            millis()-lastRightMovement>=500) {
+            failure="wheel stalled"; return false;
+        }
+        const float yawRight=mpuYaw.healthy() ? mpuYaw.yaw()*MPU_YAW_SIGN : 0.0f;
+        float steering=2.0f*yawRight+2.0f*(extraLeft-extraRight);
+        if (steering>20) steering=20;
+        if (steering< -20) steering= -20;
+        const int leftPwm=constrain((int)lroundf(125-steering),100,140);
+        const int rightPwm=constrain((int)lroundf(125+steering),100,140);
+        drive(leftPwm,rightPwm);
+        waitWithMotionService(front>80 ? 40 : (front>70 ? 20 : 12));
+        drive(0,0);
+        waitWithMotionService(30);
+        if (!readFreshFront(front)) { failure="front ToF read failed"; return false; }
+        readTicks(left,right);
+        if (left!=previousLeft) lastLeftMovement=millis();
+        if (right!=previousRight) lastRightMovement=millis();
+        previousLeft=left; previousRight=right;
+        const float travel=((left-leftStart)*CELL_LENGTH_MM/LEFT_TICKS_PER_CELL+
+                            (right-rightStart)*CELL_LENGTH_MM/RIGHT_TICKS_PER_CELL)*0.5f;
+        if (travel-checkpointTravel>=20) {
+            // A real front wall must get closer as the robot moves toward it.
+            if (checkpointFront-front<8) {
+                failure="front range did not decrease"; return false;
+            }
+            checkpointTravel=travel;
+            checkpointFront=front;
+        }
+        if (millis()-lastLog>=200) {
+            char line[140];
+            snprintf(line,sizeof(line),
+                "WALL APPROACH | front=%dmm | extra L/R=%.1f/%.1fmm | yaw=%+.1fdeg | PWM L/R=%d/%d",
+                front,
+                (left-leftStart)*CELL_LENGTH_MM/LEFT_TICKS_PER_CELL,
+                (right-rightStart)*CELL_LENGTH_MM/RIGHT_TICKS_PER_CELL,
+                yawRight,leftPwm,rightPwm);
+            debugPrintln(line);
+            lastLog=millis();
+        }
+    }
+    if (front<FRONT_WALL_MIN_IN_BAND_MM) {
+        failure="overshot reference band"; return false;
+    }
+    return true;
+}
+
+DemoMoveResult runForwardDistance(int cells = 1, bool speedRun = false) {
     if (!sensorsReady) {
         debugPrintln("REFUSED: ToF initialization failed.");
         return DemoMoveResult::Failed;
     }
+    if (cells < 1 || cells > MAX_STRAIGHT_CELLS) return DemoMoveResult::Failed;
+    const unsigned long leftTarget = LEFT_TARGET_TICKS * (unsigned long)cells;
+    const unsigned long rightTarget = RIGHT_TARGET_TICKS * (unsigned long)cells;
 
     unsigned long startLeft, startRight;
     readTicks(startLeft, startRight);
@@ -826,9 +930,7 @@ DemoMoveResult runForwardDistance() {
     unsigned long previousLeft = 0, previousRight = 0, lastLog = started;
     const char *result = "TIMEOUT";
     DemoMoveResult outcome = DemoMoveResult::Failed;
-    bool approachingFrontWall = false;
-    unsigned long frontApproachStarted = 0, approachLeft = 0, approachRight = 0;
-    int lastFrontMm = -1;
+    int lastFrontMm = -1, maxFrontMm = -1;
     unsigned long previousControlMs = started;
     approachPid.reset();
     twoWallPid.reset();
@@ -852,9 +954,8 @@ DemoMoveResult runForwardDistance() {
 
         // Brake at the nominal endpoint while getting a fresh front reading.
         // An open path finishes here; a nearby wall may need extra approach.
-        if (!approachingFrontWall &&
-            cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
-                                    RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
+        if (cellEncoderLimitReached(left, right, leftTarget - BRAKE_LEAD_TICKS,
+                                    rightTarget - BRAKE_LEAD_TICKS)) {
             drive(0, 0);
         }
         if (now - started >= MOVE_TIMEOUT_MS) break;
@@ -877,13 +978,20 @@ DemoMoveResult runForwardDistance() {
             result = "INVALID FRONT TOF READING";
             break;
         }
-        lastFrontMm = front;
-        if (sideCommunicationFault) { result="SIDE TOF COMMUNICATION FAILURE"; break; }
-        if (front <= FRONT_EMERGENCY_STOP_MM) {
-            result = "FRONT WALL REACHED: 60 MM REFERENCE TRIGGERED";
+        lastFrontMm = tofFrontFiltered;
+        if (frontFilter.full()) {
+            if (lastFrontMm > maxFrontMm) maxFrontMm = lastFrontMm;
+        } else {
+            maxFrontMm = -1;
+        }
+        // Brake as soon as a front wall is near enough for a controlled approach.
+        if (front <= FRONT_OPEN_MM) {
+            drive(0,0);
+            result = "FRONT WALL NEAR: REFERENCE APPROACH";
             outcome = DemoMoveResult::FrontWallReached;
             break;
         }
+        if (sideCommunicationFault) { result="SIDE TOF COMMUNICATION FAILURE"; break; }
         WallMode mode=wallDetector.update(sideLeft,sideRight);
         if (mode==WallMode::None && (sideLeft<0 || sideRight<0)) {
             result="CASE 3 REQUIRES TWO VALID SIDE READINGS"; break;
@@ -900,41 +1008,22 @@ DemoMoveResult runForwardDistance() {
         readTicks(rawLeft, rawRight);
         left = rawLeft - startLeft;
         right = rawRight - startRight;
-        if (!approachingFrontWall &&
-            cellEncoderLimitReached(left, right, LEFT_TARGET_TICKS - BRAKE_LEAD_TICKS,
-                                    RIGHT_TARGET_TICKS - BRAKE_LEAD_TICKS)) {
-            if (front > FRONT_OPEN_MM) {
-                result = "RUN ENCODER LIMIT REACHED";
-                outcome = DemoMoveResult::EncoderReached;
-                break;
-            }
-            approachingFrontWall = true;
-            frontApproachStarted = millis();
-            approachLeft = left; approachRight = right;
-            char line[120];
-            snprintf(line,sizeof(line),
-                "WALL APPROACH | encoder target reached | front=%dmm | continue to %dmm",
-                front,FRONT_EMERGENCY_STOP_MM);
-            debugPrintln(line);
+        if (cellEncoderLimitReached(left, right, leftTarget - BRAKE_LEAD_TICKS,
+                                    rightTarget - BRAKE_LEAD_TICKS)) {
+            result = "RUN ENCODER LIMIT REACHED";
+            outcome = DemoMoveResult::EncoderReached;
+            break;
         }
-        if (approachingFrontWall) {
-            const float extraLeft = (left-approachLeft)*CELL_LENGTH_MM/LEFT_TICKS_PER_CELL;
-            const float extraRight = (right-approachRight)*CELL_LENGTH_MM/RIGHT_TICKS_PER_CELL;
-            if (millis()-frontApproachStarted >= FRONT_APPROACH_TIMEOUT_MS ||
-                extraLeft >= FRONT_APPROACH_MAX_EXTRA_MM || extraRight >= FRONT_APPROACH_MAX_EXTRA_MM) {
-                result = "FRONT WALL APPROACH LIMIT: TARGET NOT REACHED";
-                break;
-            }
-        }
-        unsigned long leftRemaining = ticksBeforeBrake(left, LEFT_TARGET_TICKS, BRAKE_LEAD_TICKS);
-        unsigned long rightRemaining = ticksBeforeBrake(right, RIGHT_TARGET_TICKS, BRAKE_LEAD_TICKS);
+        unsigned long leftRemaining = ticksBeforeBrake(left, leftTarget, BRAKE_LEAD_TICKS);
+        unsigned long rightRemaining = ticksBeforeBrake(right, rightTarget, BRAKE_LEAD_TICKS);
         unsigned long remaining = leftRemaining < rightRemaining ? leftRemaining : rightRemaining;
         unsigned long controlMs = millis();
         float dt = (controlMs - previousControlMs) / 1000.0f;
         previousControlMs = controlMs;
         // Keep enough torque even after encoder remaining distance becomes zero.
-        int approachSpeed = approachingFrontWall ? MIN_APPROACH_PWM :
-            approachPid.update((float)remaining, dt);
+        int approachSpeed = approachPid.update((float)remaining, dt);
+        if (speedRun && remaining > APPROACH_SLOWDOWN_TICKS)
+            approachSpeed = SPEED_RUN_CRUISE_PWM;
         ForwardMotorCommands commands;
         float wallError=0, wallPwm=0, mpuPwm=0;
         float encoderError=0, encoderPwm=0;
@@ -953,7 +1042,8 @@ DemoMoveResult runForwardDistance() {
         } else {
             twoWallPid.reset();
             singleWallPid.reset();
-            approachSpeed=noWallApproachSpeed(approachSpeed,NO_WALL_MIN_BASE_PWM,FORWARD_SPEED);
+            approachSpeed=noWallApproachSpeed(approachSpeed,NO_WALL_MIN_BASE_PWM,
+                speedRun ? SPEED_RUN_CRUISE_PWM : FORWARD_SPEED);
             commands=noWallPid.update(left,right,approachSpeed,
                 NO_WALL_SETTINGS,dt,encoderError,encoderPwm);
             const bool noWallMpuReady=mpuYaw.healthy();
@@ -972,11 +1062,11 @@ DemoMoveResult runForwardDistance() {
             // One complete line reduces the number of WiFi write calls.
             char telemetry[280];
             snprintf(telemetry, sizeof(telemetry),
-                "MOVE | %s | mm F/L/R=%d/%d/%d | travel L/R=%.1f/%.1fmm | yaw=%+.2fdeg | PWM L/R=%d/%d | correction wall/mpu/enc=%.1f/%.1f/%.1f",
+                "MOVE | %s | mm F/L/R=%d/%d/%d (F raw=%d) | travel L/R=%.1f/%.1fmm | yaw=%+.2fdeg | PWM L/R=%d/%d | correction wall/mpu/enc=%.1f/%.1f/%.1f",
                 mode==WallMode::Two ? "2 walls" :
                     (mode==WallMode::LeftOnly ? "left wall" :
                     (mode==WallMode::RightOnly ? "right wall" : "no walls")),
-                front, sideLeft, sideRight,
+                tofFrontFiltered, sideLeft, sideRight, front,
                 left * CELL_LENGTH_MM / LEFT_TICKS_PER_CELL,
                 right * CELL_LENGTH_MM / RIGHT_TICKS_PER_CELL,
                 yawRight, commands.left, commands.right,
@@ -993,6 +1083,61 @@ DemoMoveResult runForwardDistance() {
     singleWallPid.reset();
     noWallPid.reset();
     waitWithMotionService(100); // Sample yaw and residual movement after braking.
+    const bool wallCandidate = outcome==DemoMoveResult::FrontWallReached ||
+        (!speedRun && outcome==DemoMoveResult::EncoderReached &&
+         frontFilter.full() && maxFrontMm>=0 &&
+         lastFrontMm>FRONT_WALL_STOP_TRIGGER_MM &&
+         lastFrontMm<=FRONT_WALL_TARGET_MM+FRONT_APPROACH_MAX_EXTRA_MM &&
+         (lastFrontMm<=FRONT_OPEN_MM || maxFrontMm-lastFrontMm>=25));
+    bool referenceAttempted = false;
+    if (wallCandidate && !motionStopRequested) {
+        if (outcome==DemoMoveResult::EncoderReached) {
+            char line[100];
+            snprintf(line,sizeof(line),
+                "WALL REFERENCE | average5 candidate max/end=%d/%dmm",
+                maxFrontMm,lastFrontMm);
+            debugPrintln(line);
+        }
+        int settledFront;
+        if (!readFrontAverage(settledFront)) {
+            result="FRONT REFERENCE READ FAILED";
+            outcome=DemoMoveResult::Failed;
+            referenceAttempted=true;
+        } else if (settledFront<=FRONT_WALL_TARGET_MM+FRONT_APPROACH_MAX_EXTRA_MM) {
+            referenceAttempted=true;
+            lastFrontMm=settledFront;
+            char line[110];
+            snprintf(line,sizeof(line),
+                "WALL REFERENCE | approach from %dmm to %dmm",
+                settledFront,FRONT_WALL_TARGET_MM);
+            debugPrintln(line);
+            unsigned long referenceLeft,referenceRight;
+            readTicks(referenceLeft,referenceRight);
+            const char *failure="none";
+            const bool reached=settleAtFrontWall(lastFrontMm,failure);
+            unsigned long finalLeft,finalRight;
+            readTicks(finalLeft,finalRight);
+            snprintf(line,sizeof(line),
+                "WALL APPROACH | front=%dmm | extra L/R=%.1f/%.1fmm | %s",
+                lastFrontMm,
+                (finalLeft-referenceLeft)*CELL_LENGTH_MM/LEFT_TICKS_PER_CELL,
+                (finalRight-referenceRight)*CELL_LENGTH_MM/RIGHT_TICKS_PER_CELL,
+                reached ? "IN BAND" : failure);
+            debugPrintln(line);
+            if (reached) {
+                result="FRONT WALL REFERENCE REACHED";
+                outcome=DemoMoveResult::FrontWallReached;
+            } else {
+                result="FRONT WALL REFERENCE NOT IN BAND";
+                outcome=DemoMoveResult::Failed;
+            }
+        } else if (outcome==DemoMoveResult::FrontWallReached) {
+            result="FRONT WALL REFERENCE DISAPPEARED";
+            outcome=DemoMoveResult::Failed;
+            referenceAttempted=true;
+        }
+    }
+    drive(0,0);
     unsigned long endLeft, endRight;
     readTicks(endLeft, endRight);
     char summary[240];
@@ -1003,14 +1148,14 @@ DemoMoveResult runForwardDistance() {
         (endRight - startRight) * CELL_LENGTH_MM / RIGHT_TICKS_PER_CELL,
         mpuYaw.yaw() * MPU_YAW_SIGN, millis() - started);
     debugPrintln(summary);
-    if (outcome == DemoMoveResult::FrontWallReached) {
+    if (referenceAttempted) {
         const bool readingInBand = lastFrontMm >= FRONT_WALL_MIN_IN_BAND_MM &&
                                    lastFrontMm <= FRONT_WALL_STOP_TRIGGER_MM;
         snprintf(summary,sizeof(summary),
                  "WALL REFERENCE | target=%dmm +/-%.1f%% | trigger=%dmm | front at brake=%dmm | %s",
                  FRONT_WALL_TARGET_MM,FRONT_WALL_TOLERANCE_PERCENT,
                  FRONT_WALL_STOP_TRIGGER_MM,lastFrontMm,
-                 readingInBand ? "IN BAND" : "BELOW BAND");
+                 readingInBand ? "IN BAND" : "OUT OF BAND");
         debugPrintln(summary);
     }
     return motionStopRequested ? DemoMoveResult::Stopped : outcome;
@@ -1251,6 +1396,48 @@ bool demoReadPaths(int &front, int &left, int &right) {
     return false;
 }
 
+bool demoReadFrontDistance(int &front, bool *covered) {
+    static unsigned long lastErrorLog=0;
+    if (covered) *covered=false;
+    if (!sensorsReady) return false;
+    const bool ready=frontTof.dataReady();
+    if (!ready && frontTof.last_status==0) return false;
+    const uint8_t readyI2c=frontTof.last_status;
+    if (readyI2c!=0) {
+        if (millis()-lastErrorLog>=2000) {
+            char line[80];
+            snprintf(line,sizeof(line),"FRONT TOF | ready I2C error=%u",readyI2c);
+            debugPrintln(line);
+            lastErrorLog=millis();
+        }
+        return false;
+    }
+    front=frontTof.read(false);
+    const bool timedOut=frontTof.timeoutOccurred();
+    const uint8_t status=(uint8_t)frontTof.ranging_data.range_status;
+    if (!timedOut && frontTof.last_status==0 && covered &&
+        (status==VL53L1X::MinRangeFail ||
+         status==VL53L1X::RangeValidMinRangeClipped)) {
+        *covered=true;
+        front=0;
+        return true;
+    }
+    if (timedOut || frontTof.last_status!=0 ||
+        !frontRangeStatusIsUsable(status)) {
+        if (millis()-lastErrorLog>=2000) {
+            char line[120];
+            snprintf(line,sizeof(line),
+                "FRONT TOF | invalid mm=%d status=%u timeout=%d i2c=%u",
+                front,status,timedOut,frontTof.last_status);
+            debugPrintln(line);
+            lastErrorLog=millis();
+        }
+        return false;
+    }
+    if (frontRangeStatusMeansOpen(status)) front=FRONT_NO_TARGET_MM;
+    return true;
+}
+
 DemoMoveResult demoMoveOneCell() {
     if (motionStopRequested) return DemoMoveResult::Stopped;
     if (!demoMotionReady()) return DemoMoveResult::Failed;
@@ -1259,6 +1446,36 @@ DemoMoveResult demoMoveOneCell() {
     // Capture a new heading after every turn, before the next forward move.
     mpuYaw.reset();
     return runForwardDistance();
+}
+
+DemoMoveResult demoMoveStraightCells(int cells) {
+    if (cells < 1 || cells > MAX_STRAIGHT_CELLS || !demoMotionReady() || motionStopRequested)
+        return DemoMoveResult::Failed;
+    unsigned long startLeft, startRight;
+    readTicks(startLeft, startRight);
+    frontFilter.reset(); leftFilter.reset(); rightFilter.reset();
+    wallDetector.reset();
+    mpuYaw.reset();
+    const DemoMoveResult outcome = runForwardDistance(cells, true);
+    if (outcome != DemoMoveResult::FrontWallReached &&
+        outcome != DemoMoveResult::EncoderReached) return outcome;
+    unsigned long endLeft, endRight;
+    readTicks(endLeft, endRight);
+    if (outcome == DemoMoveResult::EncoderReached) {
+        if (endLeft - startLeft < cells * LEFT_TARGET_TICKS - LEFT_TARGET_TICKS / 4 ||
+            endRight - startRight < cells * RIGHT_TARGET_TICKS - RIGHT_TARGET_TICKS / 4) {
+            debugPrintln("SPEED | one wheel ended too far short of the segment target");
+            return DemoMoveResult::Failed;
+        }
+        return outcome;
+    }
+    const unsigned long minimumLeft = (cells - 1) * LEFT_TARGET_TICKS + LEFT_TARGET_TICKS / 2;
+    const unsigned long minimumRight = (cells - 1) * RIGHT_TARGET_TICKS + RIGHT_TARGET_TICKS / 2;
+    if (endLeft - startLeft < minimumLeft || endRight - startRight < minimumRight) {
+        debugPrintln("SPEED | front wall stopped segment before its last cell");
+        return DemoMoveResult::Failed;
+    }
+    return outcome;
 }
 
 bool demoHeadingError(float &yawRightDegrees) {

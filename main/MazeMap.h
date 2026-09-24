@@ -26,6 +26,9 @@ class MazeMap {
   void floodFill();
   bool chooseNext(int x, int y, Direction heading, Direction &next) const;
   const MazeCell &cell(int x, int y) const;
+  bool save() const;
+  bool load();
+  static void clearSaved();
 
   static Direction leftOf(Direction direction);
   static Direction rightOf(Direction direction);

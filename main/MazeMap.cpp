@@ -1,6 +1,15 @@
 #include "MazeMap.h"
 
+#include <Preferences.h>
 #include <string.h>
+
+namespace {
+constexpr uint32_t SAVED_MAZE_MAGIC = 0x4D4D0101;
+struct SavedMaze {
+  uint32_t magic;
+  uint8_t cells[MAZE_SIZE * MAZE_SIZE * 4];
+};
+}
 
 uint8_t MazeMap::wallBit(Direction direction) {
   return (uint8_t)(1U << (uint8_t)direction);
@@ -168,4 +177,54 @@ bool MazeMap::chooseNext(int x, int y, Direction heading, Direction &next) const
 
 const MazeCell &MazeMap::cell(int x, int y) const {
   return cells_[y][x];
+}
+
+bool MazeMap::save() const {
+  SavedMaze saved = {};
+  saved.magic = SAVED_MAZE_MAGIC;
+  for (int y = 0; y < MAZE_SIZE; ++y) {
+    for (int x = 0; x < MAZE_SIZE; ++x) {
+      const int index = (y * MAZE_SIZE + x) * 4;
+      const MazeCell &cell = cells_[y][x];
+      saved.cells[index] = cell.walls;
+      saved.cells[index + 1] = cell.known;
+      saved.cells[index + 2] = cell.traversed;
+      saved.cells[index + 3] = cell.visited ? 1 : 0;
+    }
+  }
+  Preferences storage;
+  if (!storage.begin("micromouse", false)) return false;
+  const bool ok = storage.putBytes("maze", &saved, sizeof(saved)) == sizeof(saved);
+  storage.end();
+  return ok;
+}
+
+bool MazeMap::load() {
+  Preferences storage;
+  if (!storage.begin("micromouse", true)) return false;
+  SavedMaze saved = {};
+  const bool ok = storage.getBytesLength("maze") == sizeof(saved) &&
+      storage.getBytes("maze", &saved, sizeof(saved)) == sizeof(saved) &&
+      saved.magic == SAVED_MAZE_MAGIC;
+  storage.end();
+  if (!ok) return false;
+  for (int y = 0; y < MAZE_SIZE; ++y) {
+    for (int x = 0; x < MAZE_SIZE; ++x) {
+      const int index = (y * MAZE_SIZE + x) * 4;
+      MazeCell &cell = cells_[y][x];
+      cell.walls = saved.cells[index];
+      cell.known = saved.cells[index + 1];
+      cell.traversed = saved.cells[index + 2];
+      cell.visited = saved.cells[index + 3] != 0;
+    }
+  }
+  floodFill();
+  return true;
+}
+
+void MazeMap::clearSaved() {
+  Preferences storage;
+  if (!storage.begin("micromouse", false)) return;
+  storage.remove("maze");
+  storage.end();
 }
