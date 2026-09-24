@@ -7,9 +7,29 @@
 #include "config.h"
 #include "rotation.h"
 
+#ifndef MAIN_UNIT_TEST_MODE
+#define MAIN_UNIT_TEST_MODE 0  // Set to 1 to run UNIT_TEST_PATTERN.
+#endif
+
 MazeMap maze;
 bool rotationReady = false;
 bool explorerRunning = false;
+#if MAIN_UNIT_TEST_MODE
+enum class UnitTestAction { Forward, Right, Left };  // Available actions; do not repeat names here.
+
+// Edit this list to choose the test path. Forward moves one cell; turns are 90 degrees.
+constexpr UnitTestAction UNIT_TEST_PATTERN[] = {
+    UnitTestAction::Forward,
+    UnitTestAction::Forward,
+    UnitTestAction::Forward,
+    UnitTestAction::Forward,
+};
+constexpr int UNIT_TEST_STEP_COUNT =
+    sizeof(UNIT_TEST_PATTERN) / sizeof(UNIT_TEST_PATTERN[0]);
+
+bool unitTestRunning = false;
+int unitTestStep = 0;
+#endif
 unsigned long completedCells = 0;
 int robotX = 0;
 int robotY = 0;
@@ -258,6 +278,67 @@ void runFloodStep() {
   publishState("Exploring");
 }
 
+#if MAIN_UNIT_TEST_MODE
+void stopUnitTest(const char *reason) {
+  stopRotation();
+  demoEndRun();
+  unitTestRunning = false;
+  demoLog(reason);
+  publishState(reason);
+}
+
+void runUnitTestStep() {
+  if (!settle()) {
+    stopUnitTest("UNIT TEST | STOP | command received");
+    return;
+  }
+
+  const UnitTestAction action = UNIT_TEST_PATTERN[unitTestStep];
+  const char *actionName = "FORWARD 1 CELL";
+  if (action == UnitTestAction::Right) actionName = "RIGHT 90deg";
+  else if (action == UnitTestAction::Left) actionName = "LEFT 90deg";
+  char line[110];
+  snprintf(line, sizeof(line), "UNIT TEST | STEP %d/%d | %s",
+           unitTestStep + 1, UNIT_TEST_STEP_COUNT, actionName);
+  demoLog("");
+  demoLog(line);
+
+  if (action != UnitTestAction::Forward) {
+    const float turnAngle = action == UnitTestAction::Right ? -90.0f : 90.0f;
+    if (!turnDegrees(turnAngle)) {
+      stopUnitTest(demoStopped()
+          ? "UNIT TEST | STOP | turn cancelled"
+          : "UNIT TEST | FAULT | turn failed");
+      return;
+    }
+  } else {
+    const DemoMoveResult result = demoMoveOneCell();
+    if (result != DemoMoveResult::EncoderReached) {
+      if (result == DemoMoveResult::Stopped)
+        stopUnitTest("UNIT TEST | STOP | forward move cancelled");
+      else if (result == DemoMoveResult::FrontWallReached)
+        stopUnitTest("UNIT TEST | STOP | front wall interrupted scripted move");
+      else
+        stopUnitTest("UNIT TEST | FAULT | forward move failed");
+      return;
+    }
+    if (!alignArrivalHeading()) {
+      stopUnitTest(demoStopped()
+          ? "UNIT TEST | STOP | arrival alignment cancelled"
+          : "UNIT TEST | FAULT | arrival heading correction failed");
+      return;
+    }
+  }
+
+  snprintf(line, sizeof(line), "UNIT TEST | RESULT %d/%d | OK",
+           unitTestStep + 1, UNIT_TEST_STEP_COUNT);
+  demoLog(line);
+  ++unitTestStep;
+  if (unitTestStep == UNIT_TEST_STEP_COUNT)
+    stopUnitTest("UNIT TEST | COMPLETE | pattern finished");
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
   rotationReady = beginRotation();
@@ -266,26 +347,79 @@ void setup() {
 
   maze.reset();
   dashboardBegin();
+#if MAIN_UNIT_TEST_MODE
+  char patternInfo[60];
+  snprintf(patternInfo, sizeof(patternInfo), "UNIT TEST | MODE | %d scripted steps",
+           UNIT_TEST_STEP_COUNT);
+  demoLog(patternInfo);
+  demoLog("UNIT TEST | COMMANDS | s/start runs once | d/stop cancels");
+#else
   resetMap();
 
   demoLog("BUILD | flood-fill exploration-v1 | speed run disabled");
   demoLog("COMMANDS | s/start begins or resumes | d/stop stops | web reset clears map");
   demoLog("COORDINATES | start=(0,0), north=+Y, east=+X");
+#endif
   if (WiFi.status() == WL_CONNECTED) {
     char url[80];
     snprintf(url, sizeof(url), "WEB | open http://%s/",
              WiFi.localIP().toString().c_str());
     demoLog(url);
   }
-  demoLog(rotationReady && demoMotionReady()
-      ? "READY | open the web page or send s/start"
-      : "FAULT | rotation, MPU or ToF initialization failed");
-  publishState(rotationReady && demoMotionReady()
+  const bool motionReady = demoMotionReady();
+  if (!rotationReady) {
+    demoLog(rotationInitializationFault());
+    demoLog("FAULT | rotation MPU initialization failed");
+  }
+  if (!motionReady) {
+    char fault[120];
+    snprintf(fault, sizeof(fault), "FAULT | %s", demoMotionFault());
+    demoLog(fault);
+  }
+  if (rotationReady && motionReady) demoLog("READY | open the web page or send s/start");
+#if MAIN_UNIT_TEST_MODE
+  publishState(rotationReady && motionReady
+      ? "Unit test ready" : "Initialization failed");
+#else
+  publishState(rotationReady && motionReady
       ? "Ready" : "Initialization failed");
+#endif
 }
 
 void loop() {
   dashboardLoop();
+#if MAIN_UNIT_TEST_MODE
+  if (dashboardTakeReset()) {
+    if (unitTestRunning) stopUnitTest("UNIT TEST | STOP | web reset requested");
+    maze.reset();
+    demoLog("UNIT TEST | RESET | ready for a new run");
+    publishState("Unit test ready");
+  }
+
+  const MovementCommand command = demoReadCommand();
+  if (command == MovementCommand::Stop) {
+    if (unitTestRunning) stopUnitTest("UNIT TEST | STOP | command received");
+  } else if (command == MovementCommand::Start && !unitTestRunning) {
+    const bool motionReady = demoMotionReady();
+    if (!rotationReady || !motionReady) {
+      if (!rotationReady) demoLog("UNIT TEST | REFUSED | rotation MPU unavailable");
+      if (!motionReady) {
+        char fault[120];
+        snprintf(fault, sizeof(fault), "UNIT TEST | REFUSED | %s", demoMotionFault());
+        demoLog(fault);
+      }
+      publishState("Unit test initialization fault");
+    } else {
+      demoBeginRun();
+      unitTestStep = 0;
+      unitTestRunning = true;
+      demoLog("UNIT TEST | START | running scripted pattern");
+      publishState("Unit test running");
+    }
+  }
+
+  if (unitTestRunning) runUnitTestStep();
+#else
   if (dashboardTakeReset()) {
     if (explorerRunning) stopExplorer("STOP | web map reset requested");
     resetMap();
@@ -295,8 +429,14 @@ void loop() {
   if (command == MovementCommand::Stop) {
     if (explorerRunning) stopExplorer("STOP | command received");
   } else if (command == MovementCommand::Start && !explorerRunning) {
-    if (!rotationReady || !demoMotionReady()) {
-      demoLog("REFUSED | rotation, MPU or ToF unavailable; reset ESP32");
+    const bool motionReady = demoMotionReady();
+    if (!rotationReady || !motionReady) {
+      if (!rotationReady) demoLog("REFUSED | rotation MPU initialization failed; reset ESP32");
+      if (!motionReady) {
+        char fault[120];
+        snprintf(fault, sizeof(fault), "REFUSED | %s", demoMotionFault());
+        demoLog(fault);
+      }
       publishState("Initialization fault");
     } else if (maze.isGoal(robotX, robotY)) {
       demoLog("REFUSED | goal already reached; reset the map for another run");
@@ -310,6 +450,7 @@ void loop() {
   }
 
   if (explorerRunning) runFloodStep();
+#endif
   dashboardLoop();
   delay(10);
 }

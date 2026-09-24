@@ -20,10 +20,22 @@ class MpuYaw {
       Serial.printf("MPU INIT ERROR | WHO_AM_I=0x%02X expected=0x68\n", identity);
       return false;
     }
-    if (!writeByte(0x6B, 0x01)) return false;
-    delay(100);
-    if (!writeByte(0x1A, 0x06) || !writeByte(0x1B, 0x08)) return false;
-    delay(100);
+    uint8_t power1, gyroConfig;
+    if (!readBytes(0x6B, &power1, 1) ||
+        !readBytes(0x1B, &gyroConfig, 1)) return false;
+    if (power1 != 0x01 || gyroConfig != 0x08) {
+      if (!writeByte(0x6B, 0x01)) return false;
+      delay(100);
+      if (!writeByte(0x1A, 0x06) || !writeByte(0x1B, 0x08)) return false;
+      delay(100);
+      if (!readBytes(0x6B, &power1, 1) ||
+          !readBytes(0x1B, &gyroConfig, 1)) return false;
+    }
+    if (power1 != 0x01 || gyroConfig != 0x08) {
+      Serial.printf("MPU INIT ERROR | configuration did not stick | pwr1=0x%02X gyro_cfg=0x%02X\n",
+                    power1, gyroConfig);
+      return false;
+    }
 
     float sum = 0.0f;
     for (int i = 0; i < 200; ++i) {
@@ -57,7 +69,7 @@ class MpuYaw {
 
     float gyroZ;
     if (!readGyroZ(gyroZ)) {
-      ready_ = false;
+      rate_ = 0.0f;
       return;
     }
 
@@ -73,6 +85,12 @@ class MpuYaw {
 
   bool healthy() const {
     return ready_ && (unsigned long)(millis() - lastGoodMs_) <= 250;
+  }
+
+  bool initialized() const { return ready_; }
+
+  bool readPowerRegister(uint8_t &value) {
+    return readBytes(0x6B, &value, 1);
   }
 
   float yaw() const { return yaw_; }
@@ -165,8 +183,8 @@ constexpr int LEFT_ENCODER = 33, RIGHT_ENCODER = 35;
 constexpr int LEFT_XSHUT = 4, RIGHT_XSHUT = 5, FRONT_XSHUT = 16;
 
 // Tuned encoder target for one 180 mm cell.
-constexpr float LEFT_TICKS_PER_CELL = 623.0f;
-constexpr float RIGHT_TICKS_PER_CELL = 623.0f;
+constexpr float LEFT_TICKS_PER_CELL = 620.0f;
+constexpr float RIGHT_TICKS_PER_CELL = 620.0f;
 
 constexpr int CELL_LENGTH_MM = 180;
 constexpr int FORWARD_CELLS = 1;
@@ -181,8 +199,8 @@ constexpr unsigned long RIGHT_TARGET_TICKS =
     (unsigned long)(RIGHT_TICKS_PER_CELL * FORWARD_CELLS + 0.5f);
 
 static_assert(
-    LEFT_TARGET_TICKS == 623 &&
-    RIGHT_TARGET_TICKS == 623,
+    LEFT_TARGET_TICKS == 620 &&
+    RIGHT_TARGET_TICKS == 620,
     "Check one-cell targets against the tuned encoder calibration"
 );
 
@@ -249,17 +267,17 @@ constexpr SingleWallSettings SINGLE_WALL_SETTINGS = {
 };
 SingleWallController singleWallPid;
 // Case 3 uses the manual 7-cell calibration to compare travelled distance.
-constexpr float NO_WALL_ENCODER_KP = 1.7f;
-constexpr float NO_WALL_ENCODER_KI = 0.10f;
+constexpr float NO_WALL_ENCODER_KP = 13.0f;
+constexpr float NO_WALL_ENCODER_KI = 0.0f;
 constexpr float NO_WALL_ENCODER_KD = 0.0f;
-constexpr float NO_WALL_ENCODER_MAX_PWM = 30.0f;
-constexpr float NO_WALL_MPU_HEADING_KP = 10.0f;
-constexpr float NO_WALL_MPU_RATE_KD = 0.5f;
-constexpr float NO_WALL_MPU_MAX_PWM = 25.0f;
-constexpr float NO_WALL_MPU_WEIGHT = 0.80f;
-// Use the same rolling floors in every wall mode; 70/60 still stalled in the demo.
-constexpr int NO_WALL_MIN_BASE_PWM = MIN_APPROACH_PWM;
-constexpr int NO_WALL_MIN_MOTOR_PWM = WALL_SLOW_SPEED;
+constexpr float NO_WALL_ENCODER_MAX_PWM = 20.0f;
+constexpr float NO_WALL_MPU_HEADING_KP = 22.0f;
+constexpr float NO_WALL_MPU_RATE_KD = 8.2f;
+constexpr float NO_WALL_MPU_MAX_PWM = 45.0f;
+constexpr float NO_WALL_MPU_WEIGHT = 0.30f;
+// Keep both wheels above the PWM values that stalled in the no-wall run.
+constexpr int NO_WALL_MIN_BASE_PWM = 130;
+constexpr int NO_WALL_MIN_MOTOR_PWM = 100;
 constexpr NoWallSettings NO_WALL_SETTINGS = {
     LEFT_TICKS_PER_CELL, RIGHT_TICKS_PER_CELL,
     NO_WALL_MIN_MOTOR_PWM,
@@ -779,10 +797,14 @@ void reportMovementConfig() {
         FRONT_WALL_STOP_TRIGGER_MM);
     debugPrintln(line);
     snprintf(line, sizeof(line),
-        "NO WALL | MPU Kp/Kd=%.2f/%.2f max=%.0f weight=%.0f%% | encoder Kp/Ki=%.2f/%.2f max=%.0f",
+        "NO WALL | MPU Kp/Kd=%.2f/%.2f max=%.0f weight=%.0f%% | encoder Kp/Ki/Kd=%.2f/%.2f/%.2f max=%.0f",
         NO_WALL_MPU_HEADING_KP, NO_WALL_MPU_RATE_KD, NO_WALL_MPU_MAX_PWM,
         NO_WALL_MPU_WEIGHT*100.0f, NO_WALL_ENCODER_KP, NO_WALL_ENCODER_KI,
+        NO_WALL_ENCODER_KD,
         NO_WALL_ENCODER_MAX_PWM);
+    debugPrintln(line);
+    snprintf(line, sizeof(line), "NO WALL SPEED | base/motor floor=%d/%d",
+        NO_WALL_MIN_BASE_PWM, NO_WALL_MIN_MOTOR_PWM);
     debugPrintln(line);
     snprintf(line, sizeof(line),
         "WALL PID | single Kp/Ki/Kd=%.2f/%.2f/%.2f | two Kp/Ki/Kd=%.2f/%.2f/%.2f",
@@ -1019,6 +1041,8 @@ void moveForwardSetup() {
     Serial.begin(115200);
 
     delay(500);
+    uint8_t powerAtEntry = 0;
+    const bool entryReadOk = mpuYaw.readPowerRegister(powerAtEntry);
 
 
     // --------------------------------------------------------
@@ -1091,19 +1115,26 @@ void moveForwardSetup() {
     // Sensors
     // --------------------------------------------------------
 
+    uint8_t powerAfterMotorSetup = 0;
+    const bool motorReadOk = mpuYaw.readPowerRegister(powerAfterMotorSetup);
     Wire.begin(21, 22);
+    uint8_t powerAfterWire = 0;
+    const bool wireReadOk = mpuYaw.readPowerRegister(powerAfterWire);
+    sensorsReady = initSensors();
+    uint8_t powerAfterTof = 0;
+    const bool tofReadOk = mpuYaw.readPowerRegister(powerAfterTof);
+
+    initWiFi();
+    uint8_t powerAfterWiFi = 0;
+    const bool wifiReadOk = mpuYaw.readPowerRegister(powerAfterWiFi);
+    Serial.printf("MPU SETUP STAGES | idle=%02X/%d motor=%02X/%d Wire=%02X/%d ToF=%02X/%d WiFi=%02X/%d\n",
+                  powerAtEntry, entryReadOk, powerAfterMotorSetup, motorReadOk,
+                  powerAfterWire, wireReadOk, powerAfterTof, tofReadOk,
+                  powerAfterWiFi, wifiReadOk);
     debugPrintln("MPU6050 calibration: keep the robot completely still.");
     bool mpuReady=mpuYaw.begin();
     debugPrintln(mpuReady?"MPU6050 ready (direct yaw, no software Kalman filter).":"MPU initialization failed; forward movement unavailable.");
     if (MPU_YAW_SIGN==0) debugPrintln("Case 2 needs MPU_YAW_SIGN: +1 for right-positive yaw, -1 for right-negative yaw.");
-    sensorsReady = initSensors();
-
-    digitalWrite(
-        MOTOR_EN,
-        HIGH
-    );
-
-    initWiFi();
 
 
     debugPrintln(
@@ -1113,15 +1144,12 @@ void moveForwardSetup() {
     );
 
 
-    if (!sensorsReady) {
-
-        debugPrintln(
-            "Movement unavailable: ToF initialization failed. Reset to retry."
-        );
-
+    if (!sensorsReady || !mpuReady) {
+        debugPrintln("Movement unavailable: sensor initialization failed.");
         return;
     }
 
+    digitalWrite(MOTOR_EN, HIGH);
 
     debugPrintln(
         "Forward module ready for one-cell moves."
@@ -1168,6 +1196,13 @@ void moveForwardStop() {
 bool demoMotionReady() {
     mpuYaw.service();
     return sensorsReady && mpuYaw.healthy();
+}
+
+const char *demoMotionFault() {
+    if (!sensorsReady) return "ToF initialization failed";
+    if (!mpuYaw.initialized()) return "forward MPU initialization failed";
+    if (!mpuYaw.healthy()) return "forward MPU read stale; check I2C and retry";
+    return "unknown motion fault";
 }
 
 MovementCommand demoReadCommand() {
@@ -1234,6 +1269,9 @@ bool demoHeadingError(float &yawRightDegrees) {
 }
 
 void demoLog(const char *text) { debugPrintln(text); }
+void demoReadEncoderTicks(unsigned long &left, unsigned long &right) {
+    readTicks(left, right);
+}
 
 // Required by the unchanged rotation.cpp implementation.
 void logPrint(const String &text) { debugPrint(text); }

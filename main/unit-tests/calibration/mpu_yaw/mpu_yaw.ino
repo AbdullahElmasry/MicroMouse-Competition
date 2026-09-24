@@ -42,6 +42,12 @@ bool initMPU6050() {
   if (!writeMPU6050(0x1A, 0x06) || // DLPF: 5 Hz, matching previous setting.
       !writeMPU6050(0x1B, 0x08)) return false; // +/-500 degrees/second.
   delay(100);
+  uint8_t power1 = 0, gyroConfig = 0;
+  const bool powerOk = readMPU6050(0x6B, &power1, 1);
+  const bool gyroOk = readMPU6050(0x1B, &gyroConfig, 1);
+  Serial.printf("MPU CONFIG | pwr1=0x%02X ok=%d | gyro_cfg=0x%02X ok=%d\n",
+                power1, powerOk, gyroConfig, gyroOk);
+  if (!powerOk || !gyroOk || power1 != 0x01 || gyroConfig != 0x08) return false;
 
   Serial.println("Calibrating... Please keep the robot completely still.");
   float sum = 0.0f;
